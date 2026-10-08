@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bulk-certificate-generator"
+version = "1.0.0"
+description = "A FastAPI backend for bulk PDF certificate generation and job tracking."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "alembic>=1.14,<2.0",
+    "fastapi>=0.115,<1.0",
+    "pydantic-settings>=2.6,<3.0",
+    "reportlab>=4.2,<5.0",
+    "sqlalchemy>=2.0,<3.0",
+    "uvicorn[standard]>=0.32,<1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.28,<1.0",
+    "pypdf>=5.1,<6.0",
+    "pytest>=8.3,<9.0",
+    "pytest-cov>=6.0,<7.0",
+    "ruff>=0.8,<1.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"migrations/versions/*.py" = ["E501"]
+

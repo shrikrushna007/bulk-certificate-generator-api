@@ -1,0 +1,15 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: sqlite:////app/data/certificates.db
+      STORAGE_DIR: /app/data/certificates
+    volumes:
+      - certificate_data:/app/data
+    restart: unless-stopped
+
+volumes:
+  certificate_data:
+

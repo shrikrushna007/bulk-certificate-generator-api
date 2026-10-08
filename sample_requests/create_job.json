@@ -1,0 +1,17 @@
+{
+  "certificate": {
+    "title": "Advanced Backend Engineering",
+    "issuing_organization": "AEREO Learning",
+    "issue_date": "2026-10-08"
+  },
+  "recipients": [
+    {
+      "name": "Aarav Sharma",
+      "email": "aarav.sharma@example.com"
+    },
+    {
+      "name": "Meera Iyer",
+      "email": "meera.iyer@example.com"
+    }
+  ]
+}
