@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from threading import Barrier, Lock, get_ident
+
 
 class SelectiveFailureRenderer:
     def __init__(self, delegate) -> None:
@@ -8,6 +10,20 @@ class SelectiveFailureRenderer:
     def render(self, **kwargs) -> None:
         if kwargs["recipient_name"] == "Rendering Failure":
             raise RuntimeError("simulated renderer failure")
+        self.delegate.render(**kwargs)
+
+
+class ConcurrentProbeRenderer:
+    def __init__(self, delegate) -> None:
+        self.delegate = delegate
+        self.barrier = Barrier(2, timeout=5)
+        self.lock = Lock()
+        self.thread_ids: set[int] = set()
+
+    def render(self, **kwargs) -> None:
+        with self.lock:
+            self.thread_ids.add(get_ident())
+        self.barrier.wait()
         self.delegate.render(**kwargs)
 
 
@@ -31,6 +47,18 @@ def test_rendering_failure_does_not_stop_other_recipients(client, app, valid_pay
     statuses = [recipient["status"] for recipient in job["recipients"]]
     assert statuses == ["COMPLETED", "FAILED", "COMPLETED"]
     assert job["recipients"][1]["error_message"] == "Certificate generation failed."
+
+
+def test_batch_rendering_uses_bounded_concurrency(client, app, valid_payload) -> None:
+    processor = app.state.job_processor
+    probe = ConcurrentProbeRenderer(processor.renderer)
+    processor.renderer = probe
+
+    creation = client.post("/api/v1/jobs", json=valid_payload)
+    job = client.get(creation.json()["status_url"]).json()
+
+    assert job["status"] == "COMPLETED"
+    assert len(probe.thread_ids) == 2
 
 
 def test_unprocessed_job_exposes_pending_status_and_consistent_counts(app, valid_payload) -> None:

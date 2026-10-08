@@ -36,13 +36,14 @@ flowchart LR
     Jobs --> DB[(SQLite)]
     API --> Background[FastAPI background task]
     Background --> Processor[Job processor]
-    Processor --> Renderer[ReportLab renderer]
+    Processor --> Pool[Bounded render worker pool]
+    Pool --> Renderer[ReportLab renderer]
     Processor --> DB
     Renderer --> Storage[(Local PDF storage)]
     API --> Storage
 ```
 
-HTTP routes validate and translate requests but do not contain certificate-generation logic. `JobService` owns job persistence, `JobProcessor` owns status transitions and failure isolation, `CertificateRenderer` owns the single PDF design, and `CertificateStorage` confines all artifact paths beneath the configured storage root.
+HTTP routes validate and translate requests but do not contain certificate-generation logic. `JobService` owns job persistence, `JobProcessor` coordinates an application-wide bounded render pool and batched status updates, `CertificateRenderer` owns the single PDF design, and `CertificateStorage` confines all artifact paths beneath the configured storage root. Only each job coordinator writes its results, avoiding concurrent SQLite writers within a job while the global pool prevents thread growth as jobs arrive.
 
 ## Project structure
 
@@ -77,7 +78,7 @@ PDF data is not stored in SQLite. Files use generated job and certificate UUIDs,
 |---|---|---|---|
 | `GET` | `/health` | Liveness check | `200` |
 | `POST` | `/api/v1/jobs` | Create a bulk certificate job | `202` |
-| `GET` | `/api/v1/jobs/{job_id}` | Read progress and recipient outcomes | `200` |
+| `GET` | `/api/v1/jobs/{job_id}` | Read progress and paginated recipient outcomes | `200` |
 | `GET` | `/api/v1/jobs/{job_id}/certificates/{certificate_id}` | Download a completed PDF | `200` |
 
 Interactive OpenAPI documentation is available at `http://localhost:8000/docs` while the application is running.
@@ -128,6 +129,8 @@ Copy-Item .env.example .env
 | `DATABASE_URL` | No | `sqlite:///./data/certificates.db` | SQLAlchemy database URL |
 | `STORAGE_DIR` | No | `./data/certificates` | Root directory for generated PDFs |
 | `MAX_RECIPIENTS` | No | `500` | Maximum recipients accepted in one job |
+| `RENDER_WORKERS` | No | `4` | Maximum PDFs rendered concurrently across the application |
+| `PROCESSING_BATCH_SIZE` | No | `100` | Outcomes persisted in each database transaction |
 | `LOG_LEVEL` | No | `INFO` | Python logging level |
 
 Apply the database migration:
@@ -175,6 +178,18 @@ Poll job status using the returned URL:
 curl http://localhost:8000/api/v1/jobs/03bd7f9c-0c5d-42e3-8f34-6d86256c4693
 ```
 
+For frequent progress polling, omit recipient outcomes to keep the response small:
+
+```bash
+curl "http://localhost:8000/api/v1/jobs/03bd7f9c-0c5d-42e3-8f34-6d86256c4693?include_recipients=false"
+```
+
+Recipient outcomes are ordered by their original input position and paginated with `recipient_offset` and `recipient_limit`. The default page contains 100 outcomes and the maximum page size is 500:
+
+```bash
+curl "http://localhost:8000/api/v1/jobs/03bd7f9c-0c5d-42e3-8f34-6d86256c4693?recipient_offset=100&recipient_limit=100"
+```
+
 A completed recipient includes its certificate ID and download URL:
 
 ```json
@@ -202,7 +217,13 @@ A completed recipient includes its certificate ID and download URL:
       "error_message": null,
       "download_url": "/api/v1/jobs/03bd7f9c-0c5d-42e3-8f34-6d86256c4693/certificates/86f8f39b-a37a-4411-90df-cc59cd201b66"
     }
-  ]
+  ],
+  "recipient_page": {
+    "offset": 0,
+    "limit": 100,
+    "returned": 2,
+    "total": 2
+  }
 }
 ```
 
@@ -251,6 +272,21 @@ pytest --cov=app --cov-report=term-missing
 
 Tests create an isolated temporary SQLite database and storage directory for each test. The suite exercises real HTTP endpoints, SQLAlchemy persistence, actual ReportLab output, and PDF text extraction. Renderer failures are injected only where failure isolation itself is under test.
 
+## Performance characteristics
+
+The processor fetches pending recipients in bounded batches, renders each batch through one application-wide configurable thread pool, and writes all outcomes from that batch in one database transaction. Job creation also inserts recipient rows in bulk. SQLite uses WAL mode, normal synchronization, and a busy timeout to allow progress reads while generation is active.
+
+A Docker Desktop benchmark on the development machine generated 5,000 one-page certificates with four render workers and a batch size of 100:
+
+| Measurement | Sequential implementation | Batched concurrent implementation |
+|---|---:|---:|
+| Request acceptance | 1.22 seconds | 0.80 seconds |
+| Generation duration | 73.6 seconds | 18.9 seconds |
+| Successful PDFs | 5,000 | 5,000 |
+| Failed PDFs | 0 | 0 |
+
+This is a local comparison rather than a throughput guarantee. Results depend on CPU allocation, storage performance, template complexity, and recipient data. The first, middle, and final PDFs from the optimized run were downloaded and text-validated.
+
 ## Docker
 
 Build and start the API:
@@ -260,6 +296,16 @@ docker compose up --build
 ```
 
 The container applies migrations before starting Uvicorn, runs as a non-root user, and persists the SQLite database and generated PDFs in the `certificate_data` volume.
+
+Compose forwards the processing settings from `.env`. For a deliberate 5,000-recipient local test, use values such as:
+
+```dotenv
+MAX_RECIPIENTS=5000
+RENDER_WORKERS=4
+PROCESSING_BATCH_SIZE=100
+```
+
+Increase `RENDER_WORKERS` only after measuring the host. More threads can reduce performance when CPU or storage is already saturated.
 
 Stop the service:
 
@@ -272,8 +318,10 @@ Add `-v` only when intentionally deleting the persistent Docker volume and all g
 ## Design decisions and trade-offs
 
 - **In-process background execution:** FastAPI background tasks keep the create request responsive without adding Redis or a worker service. Work is not durable: terminating the process can interrupt a job, and automatic recovery is not implemented. Run one worker for predictable local processing.
-- **Per-recipient commits:** Each outcome is committed independently, preserving completed work and current counters if a later recipient fails. This trades some throughput for transparent progress and fault isolation.
-- **SQLite and local storage:** They make evaluation simple and credential-free. SQLite serializes concurrent writes, and local files are not shared across hosts, so this deployment is intended for one application instance.
+- **Bounded parallel rendering:** Independent PDFs are rendered concurrently, while a single coordinator persists results. Each future captures its own failure, so one broken recipient does not cancel the batch.
+- **Batched commits:** Outcomes are committed once per configurable batch instead of once per certificate. This substantially reduces SQLite transaction overhead; a process failure can leave up to one batch requiring reconciliation.
+- **SQLite and local storage:** They make evaluation simple and credential-free. WAL mode improves concurrent status reads, but SQLite still serializes writes and local files are not shared across hosts, so this deployment is intended for one application instance.
+- **Paginated status:** Lightweight summary polling avoids loading or serializing thousands of recipient records. Outcome pages remain available when detailed inspection is needed.
 - **Relative paths instead of PDF blobs:** The database remains small and queryable while the storage layer enforces a single trusted root.
 - **Derived progress:** Pending count and percentage derive from persisted totals, successes, and failures, reducing the number of independently mutable counters.
 
@@ -281,6 +329,7 @@ Add `-v` only when intentionally deleting the persistent Docker volume and all g
 
 - Background tasks are not durable and do not resume automatically after process termination.
 - The local SQLite and filesystem design is not intended for horizontally scaled deployment.
+- Concurrency improves throughput within one process but does not provide distributed execution or cross-host coordination.
 - There is no authentication or authorization; deploy behind an appropriate access-control layer when certificates contain private data.
 - Generated files have no automatic retention or cleanup policy.
 - The predefined template uses ReportLab core fonts. Complex writing systems require a licensed Unicode font to be bundled and registered.
@@ -293,9 +342,8 @@ Add `-v` only when intentionally deleting the persistent Docker volume and all g
 - Add authentication, ownership checks, and audit events.
 - Add retention policies, job cancellation, explicit retries, and idempotency keys.
 - Bundle a broad Unicode font and add multilingual rendering tests.
-- Add metrics and tracing for queue latency, render duration, and failure rates.
+- Add metrics and tracing for queue latency, per-batch render duration, and failure rates.
 
 ## Implementation insights
 
-The central reliability concern is not rendering a PDF; it is preserving accurate job state when validation or rendering fails midway through a bulk request. Separating request-level validation from recipient-level outcomes makes partial success explicit, while independent database updates keep counters aligned with stored recipient states. Identifier-based storage also removes recipient input from the filesystem trust boundary.
-
+The central reliability concern is not rendering a PDF; it is preserving accurate job state when validation or rendering fails midway through a bulk request. Separating request-level validation from recipient-level outcomes makes partial success explicit. Bounded rendering concurrency improves throughput while a single database writer preserves counter consistency. Identifier-based storage also removes recipient input from the filesystem trust boundary.

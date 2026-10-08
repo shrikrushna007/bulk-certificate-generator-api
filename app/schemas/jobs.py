@@ -64,6 +64,13 @@ class CertificateOutcomeResponse(BaseModel):
     download_url: str | None
 
 
+class RecipientPageResponse(BaseModel):
+    offset: int
+    limit: int
+    returned: int
+    total: int
+
+
 class JobStatusResponse(BaseModel):
     job_id: str
     status: JobStatus
@@ -79,3 +86,4 @@ class JobStatusResponse(BaseModel):
     started_at: datetime | None
     completed_at: datetime | None
     recipients: list[CertificateOutcomeResponse]
+    recipient_page: RecipientPageResponse | None

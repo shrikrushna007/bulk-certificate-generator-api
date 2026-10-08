@@ -14,15 +14,18 @@ class Database:
         connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
         self.engine = create_engine(database_url, connect_args=connect_args, pool_pre_ping=True)
         if database_url.startswith("sqlite"):
-            event.listen(self.engine, "connect", self._enable_sqlite_foreign_keys)
+            event.listen(self.engine, "connect", self._configure_sqlite_connection)
         self.session_factory = sessionmaker(
             bind=self.engine, autoflush=False, expire_on_commit=False, class_=Session
         )
 
     @staticmethod
-    def _enable_sqlite_foreign_keys(dbapi_connection: object, _: object) -> None:
+    def _configure_sqlite_connection(dbapi_connection: object, _: object) -> None:
         cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
         cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA busy_timeout=5000")
         cursor.close()
 
     @contextmanager

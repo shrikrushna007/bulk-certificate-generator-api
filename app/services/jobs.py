@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import select
-from sqlalchemy.orm import selectinload
+from sqlalchemy import insert, select, update
 
 from app.db.models import CertificateJob, CertificateRecord, CertificateStatus, JobStatus
 from app.db.session import Database
@@ -16,12 +18,35 @@ from app.services.validation import validate_recipient
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class JobRenderContext:
+    job_id: str
+    certificate_title: str
+    issuing_organization: str
+    issue_date: str
+
+
+@dataclass(frozen=True)
+class RenderItem:
+    certificate_id: str
+    recipient_name: str
+
+
+@dataclass(frozen=True)
+class RenderOutcome:
+    certificate_id: str
+    succeeded: bool
+    relative_path: str | None
+
+
 class JobService:
     def __init__(self, database: Database) -> None:
         self.database = database
 
     def create_job(self, request: JobCreateRequest) -> CertificateJob:
+        job_id = str(uuid.uuid4())
         job = CertificateJob(
+            id=job_id,
             certificate_title=request.certificate.title,
             issuing_organization=request.certificate.issuing_organization,
             issue_date=request.certificate.issue_date,
@@ -29,35 +54,47 @@ class JobService:
             success_count=0,
             failure_count=0,
         )
+        records: list[dict[str, object]] = []
         for index, recipient_input in enumerate(request.recipients):
             recipient = validate_recipient(recipient_input.name, recipient_input.email)
             status = CertificateStatus.FAILED if recipient.error else CertificateStatus.PENDING
-            job.certificates.append(
-                CertificateRecord(
-                    recipient_index=index,
-                    recipient_name=recipient.name,
-                    recipient_email=recipient.email,
-                    status=status,
-                    error_message=recipient.error,
-                )
+            records.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "job_id": job_id,
+                    "recipient_index": index,
+                    "recipient_name": recipient.name,
+                    "recipient_email": recipient.email,
+                    "status": status,
+                    "error_message": recipient.error,
+                    "file_path": None,
+                }
             )
             if recipient.error:
                 job.failure_count += 1
 
         with self.database.session() as session:
             session.add(job)
+            session.flush()
+            session.execute(insert(CertificateRecord), records)
             session.commit()
             session.refresh(job)
         return job
 
     def get_job(self, job_id: str) -> CertificateJob | None:
         with self.database.session() as session:
+            return session.get(CertificateJob, job_id)
+
+    def list_certificates(self, job_id: str, offset: int, limit: int) -> list[CertificateRecord]:
+        with self.database.session() as session:
             statement = (
-                select(CertificateJob)
-                .where(CertificateJob.id == job_id)
-                .options(selectinload(CertificateJob.certificates))
+                select(CertificateRecord)
+                .where(CertificateRecord.job_id == job_id)
+                .order_by(CertificateRecord.recipient_index)
+                .offset(offset)
+                .limit(limit)
             )
-            return session.scalar(statement)
+            return list(session.scalars(statement))
 
     def get_certificate(self, job_id: str, certificate_id: str) -> CertificateRecord | None:
         with self.database.session() as session:
@@ -69,86 +106,152 @@ class JobService:
 
 
 class JobProcessor:
-    """Processes pending certificates sequentially with recipient-level failure isolation."""
+    """Renders bounded concurrent batches and persists results through one database writer."""
 
     def __init__(
         self,
         database: Database,
         storage: CertificateStorage,
         renderer: CertificateRenderer,
+        *,
+        render_workers: int = 4,
+        batch_size: int = 100,
     ) -> None:
         self.database = database
         self.storage = storage
         self.renderer = renderer
+        self.render_workers = render_workers
+        self.batch_size = batch_size
+        self.executor = ThreadPoolExecutor(
+            max_workers=self.render_workers,
+            thread_name_prefix="certificate-render",
+        )
 
     def process(self, job_id: str) -> None:
         try:
-            self._mark_processing(job_id)
-            certificate_ids = self._pending_certificate_ids(job_id)
-            for certificate_id in certificate_ids:
-                self._process_one(job_id, certificate_id)
+            context = self._start_job(job_id)
+            if context is None:
+                return
+            while items := self._pending_batch(job_id):
+                outcomes = self._render_batch(self.executor, context, items)
+                try:
+                    self._persist_outcomes(job_id, outcomes)
+                except Exception:
+                    self._discard_generated(outcomes)
+                    raise
             self._finalize(job_id)
         except Exception:
             logger.exception("Unexpected job processing failure", extra={"job_id": job_id})
             self._fail_remaining(job_id)
 
-    def _mark_processing(self, job_id: str) -> None:
+    def close(self) -> None:
+        self.executor.shutdown(wait=True)
+
+    def _start_job(self, job_id: str) -> JobRenderContext | None:
         with self.database.session() as session:
             job = session.get(CertificateJob, job_id)
             if job is None:
-                return
+                return None
             job.status = JobStatus.PROCESSING
             job.started_at = datetime.now(UTC)
             session.commit()
+            return JobRenderContext(
+                job_id=job.id,
+                certificate_title=job.certificate_title,
+                issuing_organization=job.issuing_organization,
+                issue_date=job.issue_date.isoformat(),
+            )
 
-    def _pending_certificate_ids(self, job_id: str) -> list[str]:
+    def _pending_batch(self, job_id: str) -> list[RenderItem]:
         with self.database.session() as session:
             statement = (
-                select(CertificateRecord.id)
+                select(CertificateRecord.id, CertificateRecord.recipient_name)
                 .where(
                     CertificateRecord.job_id == job_id,
                     CertificateRecord.status == CertificateStatus.PENDING,
                 )
                 .order_by(CertificateRecord.recipient_index)
+                .limit(self.batch_size)
             )
-            return list(session.scalars(statement))
+            return [
+                RenderItem(certificate_id=certificate_id, recipient_name=recipient_name or "")
+                for certificate_id, recipient_name in session.execute(statement)
+            ]
 
-    def _process_one(self, job_id: str, certificate_id: str) -> None:
+    def _render_batch(
+        self,
+        executor: ThreadPoolExecutor,
+        context: JobRenderContext,
+        items: list[RenderItem],
+    ) -> list[RenderOutcome]:
+        futures = [executor.submit(self._render_one, context, item) for item in items]
+        return [future.result() for future in as_completed(futures)]
+
+    def _render_one(self, context: JobRenderContext, item: RenderItem) -> RenderOutcome:
+        relative_path = self.storage.relative_path(context.job_id, item.certificate_id)
+        destination = self.storage.resolve(relative_path)
+        try:
+            self.renderer.render(
+                destination=destination,
+                recipient_name=item.recipient_name,
+                certificate_title=context.certificate_title,
+                issuing_organization=context.issuing_organization,
+                issue_date=context.issue_date,
+                certificate_id=item.certificate_id,
+            )
+        except Exception:
+            logger.exception(
+                "Certificate rendering failed",
+                extra={
+                    "job_id": context.job_id,
+                    "certificate_id": item.certificate_id,
+                },
+            )
+            destination.unlink(missing_ok=True)
+            return RenderOutcome(item.certificate_id, False, None)
+        return RenderOutcome(item.certificate_id, True, relative_path.as_posix())
+
+    def _persist_outcomes(self, job_id: str, outcomes: list[RenderOutcome]) -> None:
+        successful = [outcome for outcome in outcomes if outcome.succeeded]
+        failed = [outcome for outcome in outcomes if not outcome.succeeded]
         with self.database.session() as session:
-            certificate = session.get(CertificateRecord, certificate_id)
             job = session.get(CertificateJob, job_id)
-            if (
-                certificate is None
-                or job is None
-                or certificate.status != CertificateStatus.PENDING
-            ):
-                return
-            relative_path = self.storage.relative_path(job_id, certificate_id)
-            destination = self.storage.resolve(relative_path)
-            try:
-                self.renderer.render(
-                    destination=destination,
-                    recipient_name=certificate.recipient_name or "",
-                    certificate_title=job.certificate_title,
-                    issuing_organization=job.issuing_organization,
-                    issue_date=job.issue_date.isoformat(),
-                    certificate_id=certificate.id,
+            if job is None:
+                raise RuntimeError("Certificate job disappeared during processing.")
+            if successful:
+                session.execute(
+                    update(CertificateRecord),
+                    [
+                        {
+                            "id": outcome.certificate_id,
+                            "status": CertificateStatus.COMPLETED,
+                            "file_path": outcome.relative_path,
+                            "error_message": None,
+                        }
+                        for outcome in successful
+                    ],
                 )
-            except Exception:
-                logger.exception(
-                    "Certificate rendering failed",
-                    extra={"job_id": job_id, "certificate_id": certificate_id},
+            if failed:
+                session.execute(
+                    update(CertificateRecord),
+                    [
+                        {
+                            "id": outcome.certificate_id,
+                            "status": CertificateStatus.FAILED,
+                            "file_path": None,
+                            "error_message": "Certificate generation failed.",
+                        }
+                        for outcome in failed
+                    ],
                 )
-                destination.unlink(missing_ok=True)
-                certificate.status = CertificateStatus.FAILED
-                certificate.error_message = "Certificate generation failed."
-                job.failure_count += 1
-            else:
-                certificate.status = CertificateStatus.COMPLETED
-                certificate.file_path = relative_path.as_posix()
-                certificate.error_message = None
-                job.success_count += 1
+            job.success_count += len(successful)
+            job.failure_count += len(failed)
             session.commit()
+
+    def _discard_generated(self, outcomes: list[RenderOutcome]) -> None:
+        for outcome in outcomes:
+            if outcome.relative_path:
+                self.storage.resolve(outcome.relative_path).unlink(missing_ok=True)
 
     def _finalize(self, job_id: str) -> None:
         with self.database.session() as session:
@@ -169,18 +272,18 @@ class JobProcessor:
             job = session.get(CertificateJob, job_id)
             if job is None:
                 return
-            pending = list(
-                session.scalars(
-                    select(CertificateRecord).where(
-                        CertificateRecord.job_id == job_id,
-                        CertificateRecord.status == CertificateStatus.PENDING,
-                    )
+            result = session.execute(
+                update(CertificateRecord)
+                .where(
+                    CertificateRecord.job_id == job_id,
+                    CertificateRecord.status == CertificateStatus.PENDING,
+                )
+                .values(
+                    status=CertificateStatus.FAILED,
+                    error_message="Job processing stopped unexpectedly.",
                 )
             )
-            for certificate in pending:
-                certificate.status = CertificateStatus.FAILED
-                certificate.error_message = "Job processing stopped unexpectedly."
-            job.failure_count += len(pending)
+            job.failure_count += result.rowcount
             job.status = JobStatus.PARTIALLY_COMPLETED if job.success_count else JobStatus.FAILED
             job.completed_at = datetime.now(UTC)
             session.commit()

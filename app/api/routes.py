@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse
 
 from app.api.dependencies import get_job_service
@@ -12,6 +12,7 @@ from app.schemas.jobs import (
     JobCreatedResponse,
     JobCreateRequest,
     JobStatusResponse,
+    RecipientPageResponse,
 )
 from app.services.jobs import JobService
 
@@ -64,6 +65,12 @@ def create_job(
 def get_job(
     job_id: str,
     job_service: Annotated[JobService, Depends(get_job_service)],
+    include_recipients: Annotated[
+        bool,
+        Query(description="Include a paginated recipient outcome collection."),
+    ] = True,
+    recipient_offset: Annotated[int, Query(ge=0)] = 0,
+    recipient_limit: Annotated[int, Query(ge=1, le=500)] = 100,
 ) -> JobStatusResponse:
     job = job_service.get_job(job_id)
     if job is None:
@@ -72,6 +79,11 @@ def get_job(
             detail={"code": "job_not_found", "message": "The requested job does not exist."},
         )
 
+    certificates = (
+        job_service.list_certificates(job_id, recipient_offset, recipient_limit)
+        if include_recipients
+        else []
+    )
     outcomes = [
         CertificateOutcomeResponse(
             certificate_id=certificate.id,
@@ -86,8 +98,18 @@ def get_job(
                 else None
             ),
         )
-        for certificate in job.certificates
+        for certificate in certificates
     ]
+    recipient_page = (
+        RecipientPageResponse(
+            offset=recipient_offset,
+            limit=recipient_limit,
+            returned=len(outcomes),
+            total=job.total_count,
+        )
+        if include_recipients
+        else None
+    )
     return JobStatusResponse(
         job_id=job.id,
         status=job.status,
@@ -103,6 +125,7 @@ def get_job(
         started_at=job.started_at,
         completed_at=job.completed_at,
         recipients=outcomes,
+        recipient_page=recipient_page,
     )
 
 

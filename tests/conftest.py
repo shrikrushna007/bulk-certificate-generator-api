@@ -18,6 +18,8 @@ def app(tmp_path: Path):
         database_url=f"sqlite:///{(tmp_path / 'test.db').as_posix()}",
         storage_dir=tmp_path / "certificates",
         max_recipients=5,
+        render_workers=2,
+        processing_batch_size=2,
         log_level="WARNING",
     )
     application = create_app(settings)

@@ -26,10 +26,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     storage = CertificateStorage(resolved_settings.storage_dir)
 
     @asynccontextmanager
-    async def lifespan(_: FastAPI):
+    async def lifespan(lifespan_app: FastAPI):
         storage.root.mkdir(parents=True, exist_ok=True)
-        yield
-        database.dispose()
+        try:
+            yield
+        finally:
+            lifespan_app.state.job_processor.close()
+            database.dispose()
 
     application = FastAPI(
         title="Bulk Certificate Generator API",
@@ -41,7 +44,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.state.database = database
     application.state.storage = storage
     application.state.job_service = JobService(database)
-    application.state.job_processor = JobProcessor(database, storage, CertificateRenderer())
+    application.state.job_processor = JobProcessor(
+        database,
+        storage,
+        CertificateRenderer(),
+        render_workers=resolved_settings.render_workers,
+        batch_size=resolved_settings.processing_batch_size,
+    )
 
     @application.exception_handler(RequestValidationError)
     async def validation_exception_handler(_: Request, exc: RequestValidationError) -> JSONResponse:

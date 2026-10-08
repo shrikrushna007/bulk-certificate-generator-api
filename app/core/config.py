@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./data/certificates.db"
     storage_dir: Path = Path("./data/certificates")
     max_recipients: int = Field(default=500, ge=1, le=10_000)
+    render_workers: int = Field(default=4, ge=1, le=32)
+    processing_batch_size: int = Field(default=100, ge=1, le=1_000)
     log_level: str = "INFO"
 
     @field_validator("log_level")

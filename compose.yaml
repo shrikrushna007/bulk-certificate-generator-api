@@ -6,10 +6,13 @@ services:
     environment:
       DATABASE_URL: sqlite:////app/data/certificates.db
       STORAGE_DIR: /app/data/certificates
+      MAX_RECIPIENTS: ${MAX_RECIPIENTS:-500}
+      RENDER_WORKERS: ${RENDER_WORKERS:-4}
+      PROCESSING_BATCH_SIZE: ${PROCESSING_BATCH_SIZE:-100}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
       - certificate_data:/app/data
     restart: unless-stopped
 
 volumes:
   certificate_data:
-

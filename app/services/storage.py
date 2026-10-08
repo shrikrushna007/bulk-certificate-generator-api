@@ -13,7 +13,7 @@ class CertificateStorage:
         return Path(job_id) / f"{certificate_id}.pdf"
 
     def resolve(self, relative_path: str | Path) -> Path:
-        candidate = (self.root / relative_path).resolve()
-        if candidate != self.root and self.root not in candidate.parents:
+        relative = Path(relative_path)
+        if relative.is_absolute() or ".." in relative.parts:
             raise ValueError("Certificate path escapes the configured storage directory.")
-        return candidate
+        return self.root / relative

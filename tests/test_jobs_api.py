@@ -125,6 +125,33 @@ def test_multiple_jobs_are_independent(client, valid_payload) -> None:
     assert second["total_recipients"] == 1
 
 
+def test_status_supports_lightweight_summary(client, valid_payload) -> None:
+    created, _ = create_job(client, valid_payload)
+
+    response = client.get(created["status_url"], params={"include_recipients": "false"})
+
+    assert response.status_code == 200
+    job = response.json()
+    assert job["status"] == "COMPLETED"
+    assert job["recipients"] == []
+    assert job["recipient_page"] is None
+
+
+def test_status_paginates_recipient_outcomes(client, valid_payload) -> None:
+    valid_payload["recipients"] = [{"name": f"Recipient {index}"} for index in range(5)]
+    created, _ = create_job(client, valid_payload)
+
+    response = client.get(
+        created["status_url"],
+        params={"recipient_offset": 2, "recipient_limit": 2},
+    )
+
+    assert response.status_code == 200
+    job = response.json()
+    assert [recipient["recipient_index"] for recipient in job["recipients"]] == [2, 3]
+    assert job["recipient_page"] == {"offset": 2, "limit": 2, "returned": 2, "total": 5}
+
+
 def test_unknown_job_returns_404(client) -> None:
     response = client.get("/api/v1/jobs/00000000-0000-0000-0000-000000000000")
 
