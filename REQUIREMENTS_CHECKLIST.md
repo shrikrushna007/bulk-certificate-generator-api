@@ -11,6 +11,7 @@ This checklist maps the assignment requirements to implementation components and
 | Handle long and duplicate recipient names | Wrapped/scaled text and identifier-based filenames | `test_long_recipient_name_generates_valid_pdf`, `test_duplicate_names_generate_distinct_certificates` |
 | Process outside the request handler | FastAPI `BackgroundTasks` and `JobProcessor` | Creation response asserts `PENDING`; status tests assert terminal transitions |
 | Continue after an individual rendering failure | Per-future exception boundary in the bounded render pool | `test_rendering_failure_does_not_stop_other_recipients` |
+| Preserve bulk results when one of 100 renders fails | Recipient-level error boundary and independent persistence | `test_one_failure_in_100_recipients_preserves_99_downloads` |
 | Persist job status and recipient results | SQLAlchemy job and certificate record models | Status, failure isolation, and multi-job integration tests |
 | Report consistent counts and progress | Persisted success/failure counts plus derived pending/progress values | `test_creates_and_completes_bulk_job`, `test_unprocessed_job_exposes_pending_status_and_consistent_counts` |
 | Keep large status responses bounded | Optional summary-only response and ordered recipient pagination | `test_status_supports_lightweight_summary`, `test_status_paginates_recipient_outcomes` |
@@ -20,10 +21,16 @@ This checklist maps the assignment requirements to implementation components and
 | Handle missing or failed artifacts | 409 for failed generation and 410 for missing files | `test_failed_certificate_cannot_be_downloaded`, `test_missing_generated_file_returns_410` |
 | Avoid unsafe filenames and path traversal | UUID filenames and confined path resolution | `test_generated_files_use_confined_identifier_based_paths`, `test_storage_rejects_path_traversal` |
 | Support independent jobs | UUID primary keys and job-scoped records | `test_multiple_jobs_are_independent` |
+| Make request retries idempotent | Hashed idempotency key, canonical request hash, and unique database index | `test_idempotency_replays_original_job`, `test_idempotency_key_reuse_with_different_payload_returns_conflict` |
+| Resume work interrupted by a restart | Startup reconciliation and atomic pending-to-processing claim | `test_recovery_resumes_only_pending_certificates` |
+| Detect changed certificate files | Persisted SHA-256 digest and verification/download checks | `test_certificate_checksum_and_integrity_verification` |
+| Export all job results | Transient ZIP with successful PDFs and a complete CSV report | `test_job_archive_contains_pdfs_and_complete_csv_report` |
+| Provide operational context | Structured JSON job lifecycle and failure logging | `test_json_log_formatter_includes_operational_context` |
+| Measure real-system throughput | HTTP benchmark using real persistence, rendering, hashing, and storage | `scripts/benchmark.py` and documented measured results |
 | Provide setup, execution, test, and API documentation | `README.md`, `.env.example`, sample request | Manual command review and runtime smoke test |
 
 ## Requirement interpretation
 
 The API separates validation into two levels. Errors that make the overall job undefined, such as a missing certificate definition, malformed recipient collection, empty recipient list, or oversized request, return HTTP 422 and do not create a job. Errors confined to a recipient, such as a missing or invalid name or email, create a failed recipient record while the remaining recipients continue.
 
-Background generation is an assignment-appropriate in-process mechanism. A bounded worker pool renders independent PDFs concurrently, while one coordinator persists batch outcomes to avoid concurrent SQLite writers within a job. It is not a durable or distributed queue and is deliberately documented as such. Generated PDF bytes remain on disk; the database stores metadata and relative paths rather than binary objects.
+Background generation is an assignment-appropriate in-process mechanism. A bounded worker pool renders independent PDFs concurrently, while one coordinator persists batch outcomes to avoid concurrent SQLite writers within a job. Startup reconciliation resumes persisted incomplete jobs, but the processor is not a distributed queue and the SQLite/local-storage deployment remains single-instance. Generated PDF bytes remain on disk; the database stores metadata, checksums, and relative paths rather than binary objects.

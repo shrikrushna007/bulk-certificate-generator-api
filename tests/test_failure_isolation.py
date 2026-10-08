@@ -64,7 +64,9 @@ def test_batch_rendering_uses_bounded_concurrency(client, app, valid_payload) ->
 def test_unprocessed_job_exposes_pending_status_and_consistent_counts(app, valid_payload) -> None:
     from app.schemas.jobs import JobCreateRequest
 
-    job = app.state.job_service.create_job(JobCreateRequest.model_validate(valid_payload))
+    job = app.state.job_service.create_job(
+        JobCreateRequest.model_validate(valid_payload)
+    ).job
     stored = app.state.job_service.get_job(job.id)
 
     assert stored is not None

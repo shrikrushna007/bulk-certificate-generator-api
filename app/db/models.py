@@ -50,6 +50,11 @@ class CertificateJob(Base):
         ),
         Index("ix_certificate_jobs_status", "status"),
         Index("ix_certificate_jobs_created_at", "created_at"),
+        Index(
+            "ux_certificate_jobs_idempotency_key_hash",
+            "idempotency_key_hash",
+            unique=True,
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
@@ -62,6 +67,8 @@ class CertificateJob(Base):
     total_count: Mapped[int] = mapped_column(Integer, nullable=False)
     success_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     failure_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    idempotency_key_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    request_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now
@@ -106,6 +113,7 @@ class CertificateRecord(Base):
     )
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     file_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now

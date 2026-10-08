@@ -1,16 +1,21 @@
-# Bulk Certificate Generator API
+# CertFlow — Bulk Certificate Generation API
 
 Bulk Certificate Generator API is a FastAPI service that accepts one job containing multiple recipients, generates an individual PDF certificate for every valid recipient, records recipient-level outcomes, and exposes job progress and certificate downloads.
 
-The design favors a self-contained local setup: SQLite stores job metadata and ReportLab writes PDFs to local file storage. Invalid recipients and rendering failures are isolated so they do not prevent other certificates in the same job from completing.
+The design favors a self-contained local setup: SQLite stores job metadata and ReportLab writes PDFs to local file storage. Invalid recipients and rendering failures are isolated so they do not prevent other certificates in the same job from completing. Idempotent submission, startup recovery, integrity metadata, and bulk export cover common operational failure modes without introducing external infrastructure.
 
 ## Features
 
 - Bulk job creation with HTTP 202 responses
+- Idempotent retries through the `Idempotency-Key` header
 - Request-level and recipient-level validation
 - A predefined, landscape PDF certificate template
 - Persistent job status, counters, timestamps, and recipient outcomes
 - `PENDING`, `PROCESSING`, `COMPLETED`, `PARTIALLY_COMPLETED`, and `FAILED` job states
+- Startup recovery for jobs interrupted by a process restart
+- SHA-256 integrity metadata and on-demand certificate verification
+- ZIP export containing successful PDFs and a full CSV outcome report
+- Structured JSON logs with job IDs, counts, durations, and failure context
 - Job-scoped certificate downloads with cross-job access protection
 - UUID-based filenames and storage path confinement
 - Consistent safe JSON errors without stack-trace disclosure
@@ -33,17 +38,22 @@ The design favors a self-contained local setup: SQLite stores job metadata and R
 flowchart LR
     Client --> API[FastAPI routes and schemas]
     API --> Jobs[Job service]
+    Jobs --> Idempotency[Idempotency checks]
     Jobs --> DB[(SQLite)]
     API --> Background[FastAPI background task]
     Background --> Processor[Job processor]
+    DB --> Recovery[Startup recovery]
+    Recovery --> Processor
     Processor --> Pool[Bounded render worker pool]
     Pool --> Renderer[ReportLab renderer]
     Processor --> DB
     Renderer --> Storage[(Local PDF storage)]
     API --> Storage
+    API --> Archive[ZIP and CSV exporter]
+    Archive --> Storage
 ```
 
-HTTP routes validate and translate requests but do not contain certificate-generation logic. `JobService` owns job persistence, `JobProcessor` coordinates an application-wide bounded render pool and batched status updates, `CertificateRenderer` owns the single PDF design, and `CertificateStorage` confines all artifact paths beneath the configured storage root. Only each job coordinator writes its results, avoiding concurrent SQLite writers within a job while the global pool prevents thread growth as jobs arrive.
+HTTP routes validate and translate requests but do not contain certificate-generation logic. `JobService` owns job persistence and idempotency, `JobProcessor` coordinates recovery, an application-wide bounded render pool, and batched status updates, `CertificateRenderer` owns the single PDF design, and `CertificateStorage` confines all artifact paths beneath the configured storage root. Only each job coordinator writes its results, avoiding concurrent SQLite writers within a job while the global pool prevents thread growth as jobs arrive.
 
 ## Project structure
 
@@ -56,8 +66,9 @@ HTTP routes validate and translate requests but do not contain certificate-gener
 |   |-- schemas/             # Pydantic request and response models
 |   |-- services/            # Validation, processing, rendering, and storage
 |   `-- main.py              # Application factory and exception handlers
-|-- migrations/              # Alembic environment and initial schema
+|-- migrations/              # Alembic environment and schema revisions
 |-- sample_requests/         # Copy-ready API payloads
+|-- scripts/                 # Reproducible real-system benchmark
 |-- tests/                   # Isolated API and service integration tests
 |-- .env.example
 |-- compose.yaml
@@ -68,7 +79,7 @@ HTTP routes validate and translate requests but do not contain certificate-gener
 
 ## Data model
 
-`certificate_jobs` stores certificate-wide data, lifecycle status, counters, and timestamps. `certificate_records` stores one row per submitted recipient, including its stable input order, validation or generation outcome, safe error message, and relative PDF path. A foreign key with cascade deletion associates records with their job, and a unique constraint prevents duplicate recipient positions within one job.
+`certificate_jobs` stores certificate-wide data, lifecycle status, counters, timestamps, a hashed idempotency key, and a canonical request hash. The unique key hash prevents duplicate job creation. `certificate_records` stores one row per submitted recipient, including its stable input order, validation or generation outcome, safe error message, relative PDF path, and SHA-256 digest. A foreign key with cascade deletion associates records with their job, and a unique constraint prevents duplicate recipient positions within one job.
 
 PDF data is not stored in SQLite. Files use generated job and certificate UUIDs, so duplicate or filename-like recipient names cannot collide or control filesystem paths.
 
@@ -79,7 +90,9 @@ PDF data is not stored in SQLite. Files use generated job and certificate UUIDs,
 | `GET` | `/health` | Liveness check | `200` |
 | `POST` | `/api/v1/jobs` | Create a bulk certificate job | `202` |
 | `GET` | `/api/v1/jobs/{job_id}` | Read progress and paginated recipient outcomes | `200` |
+| `GET` | `/api/v1/jobs/{job_id}/archive` | Download successful PDFs and a CSV report as ZIP | `200` |
 | `GET` | `/api/v1/jobs/{job_id}/certificates/{certificate_id}` | Download a completed PDF | `200` |
+| `GET` | `/api/v1/jobs/{job_id}/certificates/{certificate_id}/verify` | Compare a PDF with its recorded SHA-256 digest | `200` |
 
 Interactive OpenAPI documentation is available at `http://localhost:8000/docs` while the application is running.
 
@@ -132,6 +145,7 @@ Copy-Item .env.example .env
 | `RENDER_WORKERS` | No | `4` | Maximum PDFs rendered concurrently across the application |
 | `PROCESSING_BATCH_SIZE` | No | `100` | Outcomes persisted in each database transaction |
 | `LOG_LEVEL` | No | `INFO` | Python logging level |
+| `LOG_FORMAT` | No | `json` | `json` for structured logs or `text` for local readability |
 
 Apply the database migration:
 
@@ -158,6 +172,7 @@ Create a job with the included sample request:
 ```bash
 curl -i -X POST http://localhost:8000/api/v1/jobs \
   -H "Content-Type: application/json" \
+  -H "Idempotency-Key: enrollment-import-2026-10-08" \
   --data @sample_requests/create_job.json
 ```
 
@@ -168,9 +183,12 @@ Example response:
   "job_id": "03bd7f9c-0c5d-42e3-8f34-6d86256c4693",
   "status": "PENDING",
   "total_recipients": 2,
-  "status_url": "/api/v1/jobs/03bd7f9c-0c5d-42e3-8f34-6d86256c4693"
+  "status_url": "/api/v1/jobs/03bd7f9c-0c5d-42e3-8f34-6d86256c4693",
+  "idempotency_replayed": false
 }
 ```
+
+Repeating the same payload with the same key returns the original job and sets `idempotency_replayed` and the `Idempotency-Replayed` response header to `true`. Reusing a key with a different payload returns HTTP 409. Keys are stored only as SHA-256 hashes.
 
 Poll job status using the returned URL:
 
@@ -215,7 +233,8 @@ A completed recipient includes its certificate ID and download URL:
       "recipient_email": "aarav.sharma@example.com",
       "status": "COMPLETED",
       "error_message": null,
-      "download_url": "/api/v1/jobs/03bd7f9c-0c5d-42e3-8f34-6d86256c4693/certificates/86f8f39b-a37a-4411-90df-cc59cd201b66"
+      "download_url": "/api/v1/jobs/03bd7f9c-0c5d-42e3-8f34-6d86256c4693/certificates/86f8f39b-a37a-4411-90df-cc59cd201b66",
+      "sha256": "fd9d4d93115213acb37b9cc497afc1efb2d95a7793b09b92310a9b39d254fc9a"
     }
   ],
   "recipient_page": {
@@ -233,6 +252,17 @@ Download a certificate:
 curl -o certificate.pdf \
   http://localhost:8000/api/v1/jobs/03bd7f9c-0c5d-42e3-8f34-6d86256c4693/certificates/86f8f39b-a37a-4411-90df-cc59cd201b66
 ```
+
+Verify stored file integrity or download the complete job archive:
+
+```bash
+curl http://localhost:8000/api/v1/jobs/03bd7f9c-0c5d-42e3-8f34-6d86256c4693/certificates/86f8f39b-a37a-4411-90df-cc59cd201b66/verify
+
+curl -o certificates.zip \
+  http://localhost:8000/api/v1/jobs/03bd7f9c-0c5d-42e3-8f34-6d86256c4693/archive
+```
+
+The archive contains every successful PDF under `certificates/` and `report.csv` with all successful and failed recipients, error messages, checksums, and download URLs.
 
 The identifiers above are illustrative. Use the values returned by the running API.
 
@@ -255,7 +285,7 @@ Errors use a consistent envelope:
 }
 ```
 
-The download endpoint returns `404` for unknown or cross-job identifiers, `409` when generation failed or is incomplete, and `410` when the database references a completed artifact that is missing from storage.
+The download endpoint returns `404` for unknown or cross-job identifiers, `409` when generation failed, remains incomplete, or fails its checksum, and `410` when the database references a completed artifact that is missing from storage. Archive generation returns `409` until processing is terminal and `410` if a required successful artifact is missing.
 
 ## Tests and linting
 
@@ -270,22 +300,32 @@ To include coverage:
 pytest --cov=app --cov-report=term-missing
 ```
 
-Tests create an isolated temporary SQLite database and storage directory for each test. The suite exercises real HTTP endpoints, SQLAlchemy persistence, actual ReportLab output, and PDF text extraction. Renderer failures are injected only where failure isolation itself is under test.
+Tests create an isolated temporary SQLite database and storage directory for each test. The 42-test suite exercises real HTTP endpoints, SQLAlchemy persistence, actual ReportLab output, PDF text extraction, idempotency, recovery, integrity tampering, and ZIP contents. A reliability test submits 100 recipients, injects one render failure, verifies 99 successes and one failure at 100% progress, and downloads all 99 successful PDFs.
 
-## Performance characteristics
+Recovery was also exercised against the Docker service by force-stopping it during a 5,000-recipient job. The persisted state showed 1,100 completed and 3,900 pending recipients at shutdown; startup reconciliation resumed the same job and finished with 5,000 successes, zero failures, and no pending records.
+
+## Reproducible benchmark
 
 The processor fetches pending recipients in bounded batches, renders each batch through one application-wide configurable thread pool, and writes all outcomes from that batch in one database transaction. Job creation also inserts recipient rows in bulk. SQLite uses WAL mode, normal synchronization, and a busy timeout to allow progress reads while generation is active.
 
-A Docker Desktop benchmark on the development machine generated 5,000 one-page certificates with four render workers and a batch size of 100:
+A benchmark script drives the running HTTP API and uses the real database, renderer, checksum calculation, and file storage:
 
-| Measurement | Sequential implementation | Batched concurrent implementation |
-|---|---:|---:|
-| Request acceptance | 1.22 seconds | 0.80 seconds |
-| Generation duration | 73.6 seconds | 18.9 seconds |
-| Successful PDFs | 5,000 | 5,000 |
-| Failed PDFs | 0 | 0 |
+```bash
+python scripts/benchmark.py --sizes 10 100 1000
+```
 
-This is a local comparison rather than a throughput guarantee. Results depend on CPU allocation, storage performance, template complexity, and recipient data. The first, middle, and final PDFs from the optimized run were downloaded and text-validated.
+Set `MAX_RECIPIENTS` at least as high as the largest case before starting the service. The script uses a unique idempotency key per run and prints a Markdown table. Use `--json` for machine-readable output.
+
+Measured on Docker Desktop on the development machine with four render workers and a batch size of 100:
+
+| Recipients | Request acceptance | Completion | Successful | Failed | Throughput |
+|---:|---:|---:|---:|---:|---:|
+| 10 | 0.073 s | 0.230 s | 10 | 0 | 43.56 PDFs/s |
+| 100 | 0.079 s | 0.608 s | 100 | 0 | 164.53 PDFs/s |
+| 1,000 | 0.126 s | 5.204 s | 1,000 | 0 | 192.16 PDFs/s |
+| 5,000 | 0.334 s | 21.778 s | 5,000 | 0 | 229.59 PDFs/s |
+
+These are local measurements, not throughput guarantees. Results depend on CPU allocation, storage performance, template complexity, recipient data, and other host activity. The 5,000-recipient run was performed after integrity hashing was enabled.
 
 ## Docker
 
@@ -317,33 +357,37 @@ Add `-v` only when intentionally deleting the persistent Docker volume and all g
 
 ## Design decisions and trade-offs
 
-- **In-process background execution:** FastAPI background tasks keep the create request responsive without adding Redis or a worker service. Work is not durable: terminating the process can interrupt a job, and automatic recovery is not implemented. Run one worker for predictable local processing.
+- **Idempotent submission:** A unique hash of the optional client key maps retries to one job. A canonical request hash detects accidental key reuse with different content. Keys currently have no expiration policy.
+- **In-process background execution with recovery:** FastAPI background tasks keep the create request responsive without adding Redis or a worker service. On startup, persisted `PENDING` and `PROCESSING` jobs are reconciled and remaining recipient records are processed. An atomic status claim prevents two in-process coordinators from starting the same pending job.
 - **Bounded parallel rendering:** Independent PDFs are rendered concurrently, while a single coordinator persists results. Each future captures its own failure, so one broken recipient does not cancel the batch.
-- **Batched commits:** Outcomes are committed once per configurable batch instead of once per certificate. This substantially reduces SQLite transaction overhead; a process failure can leave up to one batch requiring reconciliation.
+- **Batched commits:** Outcomes are committed once per configurable batch instead of once per certificate. A crash can leave rendered files whose pending records were not committed; recovery safely overwrites their deterministic identifier-based paths.
 - **SQLite and local storage:** They make evaluation simple and credential-free. WAL mode improves concurrent status reads, but SQLite still serializes writes and local files are not shared across hosts, so this deployment is intended for one application instance.
 - **Paginated status:** Lightweight summary polling avoids loading or serializing thousands of recipient records. Outcome pages remain available when detailed inspection is needed.
 - **Relative paths instead of PDF blobs:** The database remains small and queryable while the storage layer enforces a single trusted root.
+- **Integrity rather than authenticity:** SHA-256 detects modification or corruption relative to the database record. It is not a digital signature and does not prove who issued a certificate.
+- **Transient archive generation:** ZIP output uses a spooled temporary file and is not retained after the response. This avoids persistent duplicate artifacts but still consumes local disk space for large archives.
 - **Derived progress:** Pending count and percentage derive from persisted totals, successes, and failures, reducing the number of independently mutable counters.
 
 ## Known limitations
 
-- Background tasks are not durable and do not resume automatically after process termination.
-- The local SQLite and filesystem design is not intended for horizontally scaled deployment.
-- Concurrency improves throughput within one process but does not provide distributed execution or cross-host coordination.
+- Recovery begins on restart, but the in-process queue does not provide delivery guarantees while the service is stopped. There is no independent worker or retry scheduler.
+- The local SQLite and filesystem design is intentionally single-instance and is not suitable for horizontal scaling or multiple Uvicorn workers.
+- Jobs that repeatedly fail due to a systemic renderer or storage problem require operator intervention; there is no configurable retry or dead-letter policy.
 - There is no authentication or authorization; deploy behind an appropriate access-control layer when certificates contain private data.
 - Generated files have no automatic retention or cleanup policy.
 - The predefined template uses ReportLab core fonts. Complex writing systems require a licensed Unicode font to be bundled and registered.
-- Bulk ZIP download, cancellation, retry, and webhooks are outside the required scope.
+- ZIP archives are created on demand rather than cached, so repeated large downloads repeat compression work.
+- Idempotency records do not expire automatically.
 
 ## Future improvements
 
-- Add startup reconciliation and a durable queue for restart-safe processing.
+- Move execution to a durable queue with leases, retry backoff, and dead-letter handling when multi-instance operation is needed.
 - Move artifacts to object storage and use short-lived signed download URLs.
 - Add authentication, ownership checks, and audit events.
-- Add retention policies, job cancellation, explicit retries, and idempotency keys.
+- Add retention policies, job cancellation, explicit retries, idempotency-key expiration, and webhooks.
 - Bundle a broad Unicode font and add multilingual rendering tests.
-- Add metrics and tracing for queue latency, per-batch render duration, and failure rates.
+- Export metrics and traces for queue latency, per-batch render duration, recovery, and failure rates.
 
 ## Implementation insights
 
-The central reliability concern is not rendering a PDF; it is preserving accurate job state when validation or rendering fails midway through a bulk request. Separating request-level validation from recipient-level outcomes makes partial success explicit. Bounded rendering concurrency improves throughput while a single database writer preserves counter consistency. Identifier-based storage also removes recipient input from the filesystem trust boundary.
+The central reliability concern is not rendering a PDF; it is preserving accurate job state when requests are retried or processing stops midway through a batch. Separating request-level validation from recipient-level outcomes makes partial success explicit. Idempotent creation, persisted per-recipient state, startup reconciliation, bounded rendering concurrency, and a single database writer keep the behavior understandable and testable. Identifier-based storage also removes recipient input from the filesystem trust boundary.

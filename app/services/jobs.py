@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import func, insert, select, update
+from sqlalchemy.exc import IntegrityError
 
 from app.db.models import CertificateJob, CertificateRecord, CertificateStatus, JobStatus
 from app.db.session import Database
@@ -37,13 +41,45 @@ class RenderOutcome:
     certificate_id: str
     succeeded: bool
     relative_path: str | None
+    sha256: str | None
+
+
+@dataclass(frozen=True)
+class JobCreationResult:
+    job: CertificateJob
+    replayed: bool
+
+
+@dataclass(frozen=True)
+class JobCompletion:
+    status: JobStatus
+    total_count: int
+    success_count: int
+    failure_count: int
+
+
+class IdempotencyConflictError(Exception):
+    """Raised when an idempotency key is reused for a different request."""
 
 
 class JobService:
     def __init__(self, database: Database) -> None:
         self.database = database
 
-    def create_job(self, request: JobCreateRequest) -> CertificateJob:
+    def create_job(
+        self,
+        request: JobCreateRequest,
+        idempotency_key: str | None = None,
+    ) -> JobCreationResult:
+        request_hash = self._request_hash(request)
+        key_hash = self._key_hash(idempotency_key) if idempotency_key else None
+
+        if key_hash:
+            existing = self._get_job_by_idempotency_key(key_hash)
+            if existing is not None:
+                self._ensure_matching_request(existing, request_hash)
+                return JobCreationResult(existing, replayed=True)
+
         job_id = str(uuid.uuid4())
         job = CertificateJob(
             id=job_id,
@@ -53,6 +89,8 @@ class JobService:
             total_count=len(request.recipients),
             success_count=0,
             failure_count=0,
+            idempotency_key_hash=key_hash,
+            request_hash=request_hash,
         )
         records: list[dict[str, object]] = []
         for index, recipient_input in enumerate(request.recipients):
@@ -68,18 +106,55 @@ class JobService:
                     "status": status,
                     "error_message": recipient.error,
                     "file_path": None,
+                    "sha256": None,
                 }
             )
             if recipient.error:
                 job.failure_count += 1
 
+        try:
+            with self.database.session() as session:
+                session.add(job)
+                session.flush()
+                session.execute(insert(CertificateRecord), records)
+                session.commit()
+                session.refresh(job)
+        except IntegrityError:
+            if not key_hash:
+                raise
+            existing = self._get_job_by_idempotency_key(key_hash)
+            if existing is None:
+                raise
+            self._ensure_matching_request(existing, request_hash)
+            return JobCreationResult(existing, replayed=True)
+        return JobCreationResult(job, replayed=False)
+
+    @staticmethod
+    def _request_hash(request: JobCreateRequest) -> str:
+        canonical = json.dumps(
+            request.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _key_hash(idempotency_key: str) -> str:
+        return hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+
+    def _get_job_by_idempotency_key(self, key_hash: str) -> CertificateJob | None:
         with self.database.session() as session:
-            session.add(job)
-            session.flush()
-            session.execute(insert(CertificateRecord), records)
-            session.commit()
-            session.refresh(job)
-        return job
+            return session.scalar(
+                select(CertificateJob).where(
+                    CertificateJob.idempotency_key_hash == key_hash
+                )
+            )
+
+    @staticmethod
+    def _ensure_matching_request(job: CertificateJob, request_hash: str) -> None:
+        if job.request_hash != request_hash:
+            raise IdempotencyConflictError
 
     def get_job(self, job_id: str) -> CertificateJob | None:
         with self.database.session() as session:
@@ -128,10 +203,12 @@ class JobProcessor:
         )
 
     def process(self, job_id: str) -> None:
+        started = time.perf_counter()
         try:
             context = self._start_job(job_id)
             if context is None:
                 return
+            logger.info("Certificate job processing started", extra={"job_id": job_id})
             while items := self._pending_batch(job_id):
                 outcomes = self._render_batch(self.executor, context, items)
                 try:
@@ -139,7 +216,19 @@ class JobProcessor:
                 except Exception:
                     self._discard_generated(outcomes)
                     raise
-            self._finalize(job_id)
+            completion = self._finalize(job_id)
+            if completion is not None:
+                logger.info(
+                    "Certificate job processing completed",
+                    extra={
+                        "job_id": job_id,
+                        "status": completion.status.value,
+                        "total_count": completion.total_count,
+                        "success_count": completion.success_count,
+                        "failure_count": completion.failure_count,
+                        "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                    },
+                )
         except Exception:
             logger.exception("Unexpected job processing failure", extra={"job_id": job_id})
             self._fail_remaining(job_id)
@@ -147,13 +236,63 @@ class JobProcessor:
     def close(self) -> None:
         self.executor.shutdown(wait=True)
 
+    def recover_incomplete_jobs(self) -> int:
+        job_ids: list[str] = []
+        with self.database.session() as session:
+            jobs = list(
+                session.scalars(
+                    select(CertificateJob).where(
+                        CertificateJob.status.in_([JobStatus.PENDING, JobStatus.PROCESSING])
+                    )
+                )
+            )
+            for job in jobs:
+                counts = {
+                    status: count
+                    for status, count in session.execute(
+                        select(CertificateRecord.status, func.count(CertificateRecord.id))
+                        .where(CertificateRecord.job_id == job.id)
+                        .group_by(CertificateRecord.status)
+                    )
+                }
+                job.success_count = counts.get(CertificateStatus.COMPLETED, 0)
+                job.failure_count = counts.get(CertificateStatus.FAILED, 0)
+                if job.success_count + job.failure_count == job.total_count:
+                    self._set_terminal_status(job)
+                    job.completed_at = job.completed_at or datetime.now(UTC)
+                else:
+                    job.status = JobStatus.PENDING
+                    job.started_at = None
+                    job.completed_at = None
+                    job_ids.append(job.id)
+            session.commit()
+
+        if job_ids:
+            logger.info(
+                "Recovering incomplete certificate jobs",
+                extra={"recovered_job_count": len(job_ids)},
+            )
+        for job_id in job_ids:
+            self.process(job_id)
+        return len(job_ids)
+
     def _start_job(self, job_id: str) -> JobRenderContext | None:
         with self.database.session() as session:
             job = session.get(CertificateJob, job_id)
-            if job is None:
+            if job is None or job.status != JobStatus.PENDING:
                 return None
-            job.status = JobStatus.PROCESSING
-            job.started_at = datetime.now(UTC)
+            started_at = datetime.now(UTC)
+            claim = session.execute(
+                update(CertificateJob)
+                .where(
+                    CertificateJob.id == job_id,
+                    CertificateJob.status == JobStatus.PENDING,
+                )
+                .values(status=JobStatus.PROCESSING, started_at=started_at)
+            )
+            if claim.rowcount != 1:
+                session.rollback()
+                return None
             session.commit()
             return JobRenderContext(
                 job_id=job.id,
@@ -208,8 +347,13 @@ class JobProcessor:
                 },
             )
             destination.unlink(missing_ok=True)
-            return RenderOutcome(item.certificate_id, False, None)
-        return RenderOutcome(item.certificate_id, True, relative_path.as_posix())
+            return RenderOutcome(item.certificate_id, False, None, None)
+        return RenderOutcome(
+            item.certificate_id,
+            True,
+            relative_path.as_posix(),
+            self.storage.sha256(destination),
+        )
 
     def _persist_outcomes(self, job_id: str, outcomes: list[RenderOutcome]) -> None:
         successful = [outcome for outcome in outcomes if outcome.succeeded]
@@ -227,6 +371,7 @@ class JobProcessor:
                             "status": CertificateStatus.COMPLETED,
                             "file_path": outcome.relative_path,
                             "error_message": None,
+                            "sha256": outcome.sha256,
                         }
                         for outcome in successful
                     ],
@@ -240,6 +385,7 @@ class JobProcessor:
                             "status": CertificateStatus.FAILED,
                             "file_path": None,
                             "error_message": "Certificate generation failed.",
+                            "sha256": None,
                         }
                         for outcome in failed
                     ],
@@ -253,19 +399,29 @@ class JobProcessor:
             if outcome.relative_path:
                 self.storage.resolve(outcome.relative_path).unlink(missing_ok=True)
 
-    def _finalize(self, job_id: str) -> None:
+    def _finalize(self, job_id: str) -> JobCompletion | None:
         with self.database.session() as session:
             job = session.get(CertificateJob, job_id)
             if job is None:
-                return
-            if job.success_count == job.total_count:
-                job.status = JobStatus.COMPLETED
-            elif job.success_count > 0:
-                job.status = JobStatus.PARTIALLY_COMPLETED
-            else:
-                job.status = JobStatus.FAILED
+                return None
+            self._set_terminal_status(job)
             job.completed_at = datetime.now(UTC)
             session.commit()
+            return JobCompletion(
+                status=job.status,
+                total_count=job.total_count,
+                success_count=job.success_count,
+                failure_count=job.failure_count,
+            )
+
+    @staticmethod
+    def _set_terminal_status(job: CertificateJob) -> None:
+        if job.success_count == job.total_count:
+            job.status = JobStatus.COMPLETED
+        elif job.success_count > 0:
+            job.status = JobStatus.PARTIALLY_COMPLETED
+        else:
+            job.status = JobStatus.FAILED
 
     def _fail_remaining(self, job_id: str) -> None:
         with self.database.session() as session:

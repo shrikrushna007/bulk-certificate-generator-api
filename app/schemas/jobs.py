@@ -50,6 +50,7 @@ class JobCreatedResponse(BaseModel):
     status: JobStatus
     total_recipients: int
     status_url: str
+    idempotency_replayed: bool
 
 
 class CertificateOutcomeResponse(BaseModel):
@@ -62,6 +63,7 @@ class CertificateOutcomeResponse(BaseModel):
     status: CertificateStatus
     error_message: str | None
     download_url: str | None
+    sha256: str | None
 
 
 class RecipientPageResponse(BaseModel):
@@ -87,3 +89,11 @@ class JobStatusResponse(BaseModel):
     completed_at: datetime | None
     recipients: list[CertificateOutcomeResponse]
     recipient_page: RecipientPageResponse | None
+
+
+class CertificateVerificationResponse(BaseModel):
+    job_id: str
+    certificate_id: str
+    stored_sha256: str
+    computed_sha256: str
+    valid: bool

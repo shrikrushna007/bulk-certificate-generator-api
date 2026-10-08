@@ -10,6 +10,7 @@ services:
       RENDER_WORKERS: ${RENDER_WORKERS:-4}
       PROCESSING_BATCH_SIZE: ${PROCESSING_BATCH_SIZE:-100}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
     volumes:
       - certificate_data:/app/data
     restart: unless-stopped

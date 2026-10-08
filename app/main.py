@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -12,6 +13,7 @@ from app.api.routes import router
 from app.core.config import Settings
 from app.core.logging import configure_logging
 from app.db.session import Database
+from app.services.archive import JobArchiveBuilder
 from app.services.certificate_renderer import CertificateRenderer
 from app.services.jobs import JobProcessor, JobService
 from app.services.storage import CertificateStorage
@@ -21,28 +23,35 @@ logger = logging.getLogger(__name__)
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved_settings = settings or Settings()
-    configure_logging(resolved_settings.log_level)
+    configure_logging(resolved_settings.log_level, resolved_settings.log_format)
     database = Database(resolved_settings.database_url)
     storage = CertificateStorage(resolved_settings.storage_dir)
 
     @asynccontextmanager
     async def lifespan(lifespan_app: FastAPI):
         storage.root.mkdir(parents=True, exist_ok=True)
+        recovery_task = asyncio.create_task(
+            _recover_jobs(lifespan_app.state.job_processor),
+            name="certificate-job-recovery",
+        )
+        lifespan_app.state.recovery_task = recovery_task
         try:
             yield
         finally:
+            await recovery_task
             lifespan_app.state.job_processor.close()
             database.dispose()
 
     application = FastAPI(
         title="Bulk Certificate Generator API",
-        version="1.0.0",
+        version="1.1.0",
         description="Create bulk PDF certificate jobs and retrieve recipient-level results.",
         lifespan=lifespan,
     )
     application.state.settings = resolved_settings
     application.state.database = database
     application.state.storage = storage
+    application.state.archive_builder = JobArchiveBuilder(storage)
     application.state.job_service = JobService(database)
     application.state.job_processor = JobProcessor(
         database,
@@ -105,6 +114,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     application.include_router(router)
     return application
+
+
+async def _recover_jobs(job_processor: JobProcessor) -> None:
+    try:
+        await asyncio.to_thread(job_processor.recover_incomplete_jobs)
+    except Exception:
+        logger.exception("Certificate job recovery failed")
 
 
 app = create_app()

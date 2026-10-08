@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -22,6 +23,7 @@ class Settings(BaseSettings):
     render_workers: int = Field(default=4, ge=1, le=32)
     processing_batch_size: int = Field(default=100, ge=1, le=1_000)
     log_level: str = "INFO"
+    log_format: Literal["json", "text"] = "json"
 
     @field_validator("log_level")
     @classmethod
