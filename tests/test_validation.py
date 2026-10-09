@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
+
+from app.core.config import Settings
 
 
 @pytest.mark.parametrize(
@@ -81,3 +84,8 @@ def test_invalid_email_is_an_individual_failure(client, valid_payload) -> None:
     assert job["status"] == "PARTIALLY_COMPLETED"
     assert job["recipients"][0]["error_message"] == "Recipient email is not valid."
     assert job["recipients"][1]["status"] == "COMPLETED"
+
+
+def test_explicit_s3_credentials_must_be_complete() -> None:
+    with pytest.raises(ValidationError, match="must be configured together"):
+        Settings(s3_access_key_id="local-access-key")

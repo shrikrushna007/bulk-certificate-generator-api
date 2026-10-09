@@ -1,25 +1,37 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from pathlib import Path
+from datetime import date
 from typing import Annotated, BinaryIO
 
 from fastapi import (
     APIRouter,
     BackgroundTasks,
     Depends,
+    File,
+    Form,
     Header,
     HTTPException,
     Query,
     Request,
     Response,
+    UploadFile,
     status,
 )
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 
 from app.api.dependencies import get_job_service
-from app.db.models import CertificateRecord, CertificateStatus, JobStatus
+from app.db.models import (
+    ArchiveStatus,
+    CertificateJob,
+    CertificateRecord,
+    CertificateStatus,
+    JobStatus,
+)
 from app.schemas.jobs import (
+    ArchiveRequestedResponse,
+    CertificateDetailsInput,
     CertificateOutcomeResponse,
     CertificateVerificationResponse,
     JobCreatedResponse,
@@ -28,6 +40,8 @@ from app.schemas.jobs import (
     RecipientPageResponse,
 )
 from app.services.archive import ArchiveFileMissingError, ArchiveIntegrityError
+from app.services.csv_import import CsvImportError, inspect_csv, iter_csv_recipients
+from app.services.dispatch import DispatchUnavailableError
 from app.services.jobs import IdempotencyConflictError, JobService
 
 router = APIRouter()
@@ -66,15 +80,7 @@ def create_job(
                 ),
             },
         )
-    normalized_key = idempotency_key.strip() if idempotency_key is not None else None
-    if idempotency_key is not None and not normalized_key:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail={
-                "code": "invalid_idempotency_key",
-                "message": "Idempotency-Key must not be blank.",
-            },
-        )
+    normalized_key = _normalize_idempotency_key(idempotency_key)
     try:
         creation = job_service.create_job(payload, normalized_key)
     except IdempotencyConflictError as exc:
@@ -88,15 +94,76 @@ def create_job(
     job = creation.job
     if creation.replayed:
         response.headers["Idempotency-Replayed"] = "true"
-    else:
-        background_tasks.add_task(request.app.state.job_processor.process, job.id)
-    return JobCreatedResponse(
-        job_id=job.id,
-        status=job.status,
-        total_recipients=job.total_count,
-        status_url=f"/api/v1/jobs/{job.id}",
-        idempotency_replayed=creation.replayed,
-    )
+    _dispatch_job(request, background_tasks, job.id, creation.replayed, job.status)
+    return _created_response(job, creation.replayed)
+
+
+@router.post(
+    "/api/v1/jobs/import",
+    response_model=JobCreatedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["certificate jobs"],
+)
+def import_csv_job(
+    background_tasks: BackgroundTasks,
+    request: Request,
+    response: Response,
+    job_service: Annotated[JobService, Depends(get_job_service)],
+    title: Annotated[str, Form(max_length=200)],
+    issuing_organization: Annotated[str, Form(max_length=200)],
+    issue_date: Annotated[date, Form()],
+    recipients: Annotated[UploadFile, File(description="UTF-8 CSV with name and email columns")],
+    idempotency_key: Annotated[
+        str | None,
+        Header(alias="Idempotency-Key", max_length=255),
+    ] = None,
+) -> JobCreatedResponse:
+    normalized_key = _normalize_idempotency_key(idempotency_key)
+    try:
+        certificate = CertificateDetailsInput(
+            title=title,
+            issuing_organization=issuing_organization,
+            issue_date=issue_date,
+        )
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "code": "invalid_certificate_details",
+                "message": "The certificate details are invalid.",
+            },
+        ) from exc
+    try:
+        inspection = inspect_csv(
+            recipients.file,
+            certificate,
+            request.app.state.settings.max_csv_recipients,
+        )
+        creation = job_service.create_streamed_job(
+            certificate=certificate,
+            recipients=iter_csv_recipients(recipients.file),
+            total_count=inspection.recipient_count,
+            request_hash=inspection.request_hash,
+            idempotency_key=normalized_key,
+        )
+    except CsvImportError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
+    except IdempotencyConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "idempotency_key_conflict",
+                "message": "The idempotency key was already used with a different request.",
+            },
+        ) from exc
+    job = creation.job
+    if creation.replayed:
+        response.headers["Idempotency-Replayed"] = "true"
+    _dispatch_job(request, background_tasks, job.id, creation.replayed, job.status)
+    return _created_response(job, creation.replayed)
 
 
 @router.get(
@@ -167,8 +234,64 @@ def get_job(
         created_at=job.created_at,
         started_at=job.started_at,
         completed_at=job.completed_at,
+        archive_status=job.archive_status,
+        archive_download_url=(
+            f"/api/v1/jobs/{job.id}/archive"
+            if job.archive_status == ArchiveStatus.COMPLETED
+            else None
+        ),
         recipients=outcomes,
         recipient_page=recipient_page,
+    )
+
+
+@router.post(
+    "/api/v1/jobs/{job_id}/archive",
+    response_model=ArchiveRequestedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["certificates"],
+)
+def request_job_archive(
+    job_id: str,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    job_service: Annotated[JobService, Depends(get_job_service)],
+) -> ArchiveRequestedResponse:
+    job = job_service.get_job(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "job_not_found", "message": "The requested job does not exist."},
+        )
+    if job.status in {JobStatus.PENDING, JobStatus.PROCESSING}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "job_not_finished",
+                "message": "An archive can be requested after job processing finishes.",
+            },
+        )
+    requested = job_service.request_archive(job_id)
+    if requested is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    if requested.archive_status == ArchiveStatus.PENDING:
+        if request.app.state.settings.processing_mode == "distributed":
+            try:
+                request.app.state.dispatcher.dispatch_archive(job_id)
+            except DispatchUnavailableError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail={
+                        "code": "archive_queue_unavailable",
+                        "message": "The archive request was saved but could not be queued.",
+                    },
+                ) from exc
+        else:
+            background_tasks.add_task(request.app.state.archive_processor.process, job_id)
+    return ArchiveRequestedResponse(
+        job_id=job_id,
+        status=requested.archive_status,
+        download_url=f"/api/v1/jobs/{job_id}/archive",
     )
 
 
@@ -196,9 +319,36 @@ def download_job_archive(
                 "message": "The archive is available after job processing finishes.",
             },
         )
-    certificates = job_service.list_certificates(job_id, 0, job.total_count)
+    if job.archive_status == ArchiveStatus.COMPLETED and job.archive_path:
+        if not request.app.state.storage.exists(job.archive_path):
+            raise HTTPException(
+                status_code=status.HTTP_410_GONE,
+                detail={
+                    "code": "archive_file_missing",
+                    "message": "The generated archive is no longer available.",
+                },
+            )
+        return StreamingResponse(
+            request.app.state.storage.iter_bytes(job.archive_path),
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="certificates-{job.id}.zip"'
+            },
+        )
+    if request.app.state.settings.processing_mode == "distributed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "archive_not_ready",
+                "message": "Request the archive and wait for archive_status COMPLETED.",
+                "status": job.archive_status.value,
+            },
+        )
     try:
-        archive = request.app.state.archive_builder.build(job, certificates)
+        archive = request.app.state.archive_builder.build(
+            job,
+            lambda: job_service.iter_certificates(job_id),
+        )
     except ArchiveFileMissingError as exc:
         raise HTTPException(
             status_code=status.HTTP_410_GONE,
@@ -237,7 +387,7 @@ def verify_certificate(
     request: Request,
     job_service: Annotated[JobService, Depends(get_job_service)],
 ) -> CertificateVerificationResponse:
-    certificate, path = _available_certificate(job_id, certificate_id, request, job_service)
+    certificate = _available_certificate(job_id, certificate_id, request, job_service)
     if not certificate.sha256:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -246,7 +396,7 @@ def verify_certificate(
                 "message": "This certificate does not have recorded integrity metadata.",
             },
         )
-    computed = request.app.state.storage.sha256(path)
+    computed = request.app.state.storage.sha256_key(certificate.file_path)
     return CertificateVerificationResponse(
         job_id=job_id,
         certificate_id=certificate_id,
@@ -259,16 +409,19 @@ def verify_certificate(
 @router.get(
     "/api/v1/jobs/{job_id}/certificates/{certificate_id}",
     tags=["certificates"],
-    response_class=FileResponse,
+    response_class=StreamingResponse,
 )
 def download_certificate(
     job_id: str,
     certificate_id: str,
     request: Request,
     job_service: Annotated[JobService, Depends(get_job_service)],
-) -> FileResponse:
-    certificate, path = _available_certificate(job_id, certificate_id, request, job_service)
-    if certificate.sha256 and request.app.state.storage.sha256(path) != certificate.sha256:
+) -> StreamingResponse:
+    certificate = _available_certificate(job_id, certificate_id, request, job_service)
+    if (
+        certificate.sha256
+        and request.app.state.storage.sha256_key(certificate.file_path) != certificate.sha256
+    ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
@@ -276,10 +429,12 @@ def download_certificate(
                 "message": "The certificate file failed its integrity check.",
             },
         )
-    return FileResponse(
-        path,
+    return StreamingResponse(
+        request.app.state.storage.iter_bytes(certificate.file_path),
         media_type="application/pdf",
-        filename=f"certificate-{certificate.id}.pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="certificate-{certificate.id}.pdf"'
+        },
     )
 
 
@@ -288,7 +443,7 @@ def _available_certificate(
     certificate_id: str,
     request: Request,
     job_service: JobService,
-) -> tuple[CertificateRecord, Path]:
+) -> CertificateRecord:
     if job_service.get_job(job_id) is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -311,8 +466,7 @@ def _available_certificate(
                 "message": "The certificate was not generated successfully.",
             },
         )
-    path = request.app.state.storage.resolve(certificate.file_path)
-    if not path.is_file():
+    if not request.app.state.storage.exists(certificate.file_path):
         raise HTTPException(
             status_code=status.HTTP_410_GONE,
             detail={
@@ -320,7 +474,58 @@ def _available_certificate(
                 "message": "The generated certificate file is no longer available.",
             },
         )
-    return certificate, path
+    return certificate
+
+
+def _normalize_idempotency_key(idempotency_key: str | None) -> str | None:
+    normalized = idempotency_key.strip() if idempotency_key is not None else None
+    if idempotency_key is not None and not normalized:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "code": "invalid_idempotency_key",
+                "message": "Idempotency-Key must not be blank.",
+            },
+        )
+    return normalized
+
+
+def _dispatch_job(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    job_id: str,
+    replayed: bool,
+    job_status: JobStatus,
+) -> None:
+    if job_status not in {JobStatus.PENDING, JobStatus.PROCESSING}:
+        return
+    if request.app.state.settings.processing_mode == "distributed":
+        try:
+            request.app.state.dispatcher.dispatch(job_id)
+        except DispatchUnavailableError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "code": "job_queue_unavailable",
+                    "message": (
+                        "The job was saved but could not be queued. "
+                        "Retry with the same idempotency key."
+                    ),
+                    "job_id": job_id,
+                },
+            ) from exc
+    elif not replayed:
+        background_tasks.add_task(request.app.state.job_processor.process, job_id)
+
+
+def _created_response(job: CertificateJob, replayed: bool) -> JobCreatedResponse:
+    return JobCreatedResponse(
+        job_id=job.id,
+        status=job.status,
+        total_recipients=job.total_count,
+        status_url=f"/api/v1/jobs/{job.id}",
+        idempotency_replayed=replayed,
+    )
 
 
 def _read_and_close(archive: BinaryIO) -> Iterator[bytes]:

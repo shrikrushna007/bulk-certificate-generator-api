@@ -1,0 +1,134 @@
+x-app-environment: &app-environment
+  PROCESSING_MODE: distributed
+  DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:?Set POSTGRES_USER}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:?Set POSTGRES_DB}
+  CELERY_BROKER_URL: redis://redis:6379/0
+  STORAGE_BACKEND: s3
+  S3_ENDPOINT_URL: http://object-storage:9000
+  S3_BUCKET: certflow
+  S3_REGION: us-east-1
+  S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:?Set S3_ACCESS_KEY_ID}
+  S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:?Set S3_SECRET_ACCESS_KEY}
+  S3_AUTO_CREATE_BUCKET: "true"
+  DISTRIBUTED_JOB_PARALLELISM: ${DISTRIBUTED_JOB_PARALLELISM:-16}
+  PROCESSING_BATCH_SIZE: ${PROCESSING_BATCH_SIZE:-100}
+  RENDER_WORKERS: ${RENDER_WORKERS:-1}
+  CLAIM_TIMEOUT_SECONDS: ${CLAIM_TIMEOUT_SECONDS:-300}
+  MAX_RECIPIENTS: ${MAX_RECIPIENTS:-500}
+  MAX_CSV_RECIPIENTS: ${MAX_CSV_RECIPIENTS:-0}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  LOG_FORMAT: ${LOG_FORMAT:-json}
+
+services:
+  api:
+    build: .
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    environment: *app-environment
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      object-storage:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: >-
+      celery -A app.celery_app:celery_app worker
+      --loglevel=INFO
+      --concurrency=${CELERY_WORKER_CONCURRENCY:-2}
+      --max-tasks-per-child=100
+    environment: *app-environment
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  beat:
+    build: .
+    command: >-
+      celery -A app.celery_app:celery_app beat
+      --loglevel=INFO
+      --schedule=/tmp/celerybeat-schedule
+    environment: *app-environment
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:8-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  object-storage-permissions:
+    image: alpine:3.22
+    command: >-
+      sh -c "chown -R 10001:10001 /data && echo 'Object storage permissions ready'"
+    volumes:
+      - object_storage_data:/data
+    restart: "no"
+
+  object-storage:
+    image: rustfs/rustfs:1.0.1
+    environment:
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY_ID:?Set S3_ACCESS_KEY_ID}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_ACCESS_KEY:?Set S3_SECRET_ACCESS_KEY}
+      RUSTFS_OBS_LOGGER_LEVEL: info
+    depends_on:
+      object-storage-permissions:
+        condition: service_completed_successfully
+    volumes:
+      - object_storage_data:/data
+    ports:
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "sh", "-ec", "curl -fsS http://127.0.0.1:9000/health && curl -fsS http://127.0.0.1:9001/rustfs/console/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  object_storage_data:

@@ -5,6 +5,7 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -12,9 +13,15 @@ from datetime import UTC, datetime
 from sqlalchemy import func, insert, select, update
 from sqlalchemy.exc import IntegrityError
 
-from app.db.models import CertificateJob, CertificateRecord, CertificateStatus, JobStatus
+from app.db.models import (
+    ArchiveStatus,
+    CertificateJob,
+    CertificateRecord,
+    CertificateStatus,
+    JobStatus,
+)
 from app.db.session import Database
-from app.schemas.jobs import JobCreateRequest
+from app.schemas.jobs import CertificateDetailsInput, JobCreateRequest, RecipientInput
 from app.services.certificate_renderer import CertificateRenderer
 from app.services.storage import CertificateStorage
 from app.services.validation import validate_recipient
@@ -72,6 +79,23 @@ class JobService:
         idempotency_key: str | None = None,
     ) -> JobCreationResult:
         request_hash = self._request_hash(request)
+        return self.create_streamed_job(
+            certificate=request.certificate,
+            recipients=request.recipients,
+            total_count=len(request.recipients),
+            request_hash=request_hash,
+            idempotency_key=idempotency_key,
+        )
+
+    def create_streamed_job(
+        self,
+        *,
+        certificate: CertificateDetailsInput,
+        recipients: Iterable[RecipientInput],
+        total_count: int,
+        request_hash: str,
+        idempotency_key: str | None = None,
+    ) -> JobCreationResult:
         key_hash = self._key_hash(idempotency_key) if idempotency_key else None
 
         if key_hash:
@@ -83,40 +107,51 @@ class JobService:
         job_id = str(uuid.uuid4())
         job = CertificateJob(
             id=job_id,
-            certificate_title=request.certificate.title,
-            issuing_organization=request.certificate.issuing_organization,
-            issue_date=request.certificate.issue_date,
-            total_count=len(request.recipients),
+            certificate_title=certificate.title,
+            issuing_organization=certificate.issuing_organization,
+            issue_date=certificate.issue_date,
+            total_count=total_count,
             success_count=0,
             failure_count=0,
             idempotency_key_hash=key_hash,
             request_hash=request_hash,
         )
-        records: list[dict[str, object]] = []
-        for index, recipient_input in enumerate(request.recipients):
-            recipient = validate_recipient(recipient_input.name, recipient_input.email)
-            status = CertificateStatus.FAILED if recipient.error else CertificateStatus.PENDING
-            records.append(
-                {
-                    "id": str(uuid.uuid4()),
-                    "job_id": job_id,
-                    "recipient_index": index,
-                    "recipient_name": recipient.name,
-                    "recipient_email": recipient.email,
-                    "status": status,
-                    "error_message": recipient.error,
-                    "file_path": None,
-                    "sha256": None,
-                }
-            )
-            if recipient.error:
-                job.failure_count += 1
-
         try:
             with self.database.session() as session:
                 session.add(job)
                 session.flush()
-                session.execute(insert(CertificateRecord), records)
+                record_count = 0
+                records: list[dict[str, object]] = []
+                for index, recipient_input in enumerate(recipients):
+                    recipient = validate_recipient(recipient_input.name, recipient_input.email)
+                    record_status = (
+                        CertificateStatus.FAILED
+                        if recipient.error
+                        else CertificateStatus.PENDING
+                    )
+                    records.append(
+                        {
+                            "id": str(uuid.uuid4()),
+                            "job_id": job_id,
+                            "recipient_index": index,
+                            "recipient_name": recipient.name,
+                            "recipient_email": recipient.email,
+                            "status": record_status,
+                            "error_message": recipient.error,
+                            "file_path": None,
+                            "sha256": None,
+                        }
+                    )
+                    record_count += 1
+                    if recipient.error:
+                        job.failure_count += 1
+                    if len(records) >= 1_000:
+                        session.execute(insert(CertificateRecord), records)
+                        records.clear()
+                if records:
+                    session.execute(insert(CertificateRecord), records)
+                if record_count != total_count:
+                    raise ValueError("Recipient stream changed while the job was created.")
                 session.commit()
                 session.refresh(job)
         except IntegrityError:
@@ -171,6 +206,20 @@ class JobService:
             )
             return list(session.scalars(statement))
 
+    def iter_certificates(
+        self,
+        job_id: str,
+        batch_size: int = 1_000,
+    ) -> Iterator[CertificateRecord]:
+        with self.database.session() as session:
+            statement = (
+                select(CertificateRecord)
+                .where(CertificateRecord.job_id == job_id)
+                .order_by(CertificateRecord.recipient_index)
+                .execution_options(yield_per=batch_size)
+            )
+            yield from session.scalars(statement)
+
     def get_certificate(self, job_id: str, certificate_id: str) -> CertificateRecord | None:
         with self.database.session() as session:
             statement = select(CertificateRecord).where(
@@ -178,6 +227,19 @@ class JobService:
                 CertificateRecord.job_id == job_id,
             )
             return session.scalar(statement)
+
+    def request_archive(self, job_id: str) -> CertificateJob | None:
+        with self.database.session() as session:
+            job = session.get(CertificateJob, job_id, with_for_update=True)
+            if job is None:
+                return None
+            if job.archive_status in {ArchiveStatus.NOT_REQUESTED, ArchiveStatus.FAILED}:
+                job.archive_status = ArchiveStatus.PENDING
+                job.archive_error = None
+                job.archive_claim_token = None
+                job.archive_lease_expires_at = None
+            session.commit()
+            return job
 
 
 class JobProcessor:

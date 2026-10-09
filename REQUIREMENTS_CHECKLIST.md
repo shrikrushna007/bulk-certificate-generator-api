@@ -1,36 +1,37 @@
 # Requirements Traceability
 
-This checklist maps the assignment requirements to implementation components and automated tests.
+This checklist maps assignment and reliability requirements to implementation and verification.
 
 | Requirement | Implementation | Verification |
 |---|---|---|
-| Accept one request containing many recipients | `POST /api/v1/jobs` and `JobCreateRequest` | `test_creates_and_completes_bulk_job` |
-| Validate job-level input | Pydantic request schemas and the configured recipient limit | `test_request_level_validation_returns_consistent_422`, `test_recipient_limit_is_enforced`, `test_extra_fields_are_rejected` |
-| Isolate invalid recipient data | `validate_recipient` and failed `CertificateRecord` rows | `test_invalid_recipient_isolated_from_valid_recipient`, `test_missing_and_wrong_type_names_are_individual_failures`, `test_all_invalid_recipients_produce_failed_job` |
-| Generate one certificate per valid recipient | `CertificateRenderer` predefined ReportLab template | `test_generated_pdf_is_retrievable_and_contains_expected_text` |
-| Handle long and duplicate recipient names | Wrapped/scaled text and identifier-based filenames | `test_long_recipient_name_generates_valid_pdf`, `test_duplicate_names_generate_distinct_certificates` |
-| Process outside the request handler | FastAPI `BackgroundTasks` and `JobProcessor` | Creation response asserts `PENDING`; status tests assert terminal transitions |
-| Continue after an individual rendering failure | Per-future exception boundary in the bounded render pool | `test_rendering_failure_does_not_stop_other_recipients` |
-| Preserve bulk results when one of 100 renders fails | Recipient-level error boundary and independent persistence | `test_one_failure_in_100_recipients_preserves_99_downloads` |
-| Persist job status and recipient results | SQLAlchemy job and certificate record models | Status, failure isolation, and multi-job integration tests |
-| Report consistent counts and progress | Persisted success/failure counts plus derived pending/progress values | `test_creates_and_completes_bulk_job`, `test_unprocessed_job_exposes_pending_status_and_consistent_counts` |
-| Keep large status responses bounded | Optional summary-only response and ordered recipient pagination | `test_status_supports_lightweight_summary`, `test_status_paginates_recipient_outcomes` |
-| Retrieve a generated certificate | Job-scoped PDF download endpoint | `test_generated_pdf_is_retrievable_and_contains_expected_text` |
-| Reject invalid job and certificate IDs | Safe 404 API errors | `test_unknown_job_returns_404`, `test_unknown_certificate_returns_404` |
-| Prevent cross-job certificate access | Query constrained by both job ID and certificate ID | `test_cross_job_certificate_access_is_rejected` |
-| Handle missing or failed artifacts | 409 for failed generation and 410 for missing files | `test_failed_certificate_cannot_be_downloaded`, `test_missing_generated_file_returns_410` |
-| Avoid unsafe filenames and path traversal | UUID filenames and confined path resolution | `test_generated_files_use_confined_identifier_based_paths`, `test_storage_rejects_path_traversal` |
-| Support independent jobs | UUID primary keys and job-scoped records | `test_multiple_jobs_are_independent` |
-| Make request retries idempotent | Hashed idempotency key, canonical request hash, and unique database index | `test_idempotency_replays_original_job`, `test_idempotency_key_reuse_with_different_payload_returns_conflict` |
-| Resume work interrupted by a restart | Startup reconciliation and atomic pending-to-processing claim | `test_recovery_resumes_only_pending_certificates` |
-| Detect changed certificate files | Persisted SHA-256 digest and verification/download checks | `test_certificate_checksum_and_integrity_verification` |
-| Export all job results | Transient ZIP with successful PDFs and a complete CSV report | `test_job_archive_contains_pdfs_and_complete_csv_report` |
-| Provide operational context | Structured JSON job lifecycle and failure logging | `test_json_log_formatter_includes_operational_context` |
-| Measure real-system throughput | HTTP benchmark using real persistence, rendering, hashing, and storage | `scripts/benchmark.py` and documented measured results |
-| Provide setup, execution, test, and API documentation | `README.md`, `.env.example`, sample request | Manual command review and runtime smoke test |
+| Submit multiple recipients | JSON and streaming CSV job endpoints | `test_creates_and_completes_bulk_job`, `test_streaming_csv_import_creates_large_job_without_json_limit` |
+| Validate job-level input | Pydantic schemas, JSON cap, CSV structure checks | Request validation and CSV header tests |
+| Isolate invalid recipients | `validate_recipient` and failed recipient rows | Invalid-name and invalid-email tests |
+| Generate professional PDFs | ReportLab renderer with wrapped/scaled text | PDF content, long-name, and duplicate-name tests |
+| Process outside request handling | FastAPI background task or Celery workers | Pending-state and distributed processor tests |
+| Isolate one render failure | Per-recipient future outcomes | 100-recipient fault-injection test verifies 99/1 |
+| Persist status and progress | Normalized jobs and recipient records | Status, counter, recovery, and multiple-job tests |
+| Bound large status responses | Summary mode and recipient pagination | Summary and pagination tests |
+| Retrieve job-scoped PDFs | Job-and-certificate constrained query | Download, invalid ID, and cross-job tests |
+| Handle missing artifacts | Safe 409/410 responses | Failed and missing certificate tests |
+| Prevent unsafe paths | UUID keys and confined local resolver | Storage traversal and filename tests |
+| Make retries idempotent | Unique hashed key plus canonical request hash | JSON and CSV replay/conflict tests |
+| Recover interrupted local jobs | Startup reconciliation | Local recovery test and restart exercise |
+| Scale work across processes | PostgreSQL batch claims with `SKIP LOCKED` | Distributed batch claim integration test |
+| Fence stale workers | Claim tokens, leases, attempt-specific object keys | Expired recipient-claim recovery test |
+| Recover interrupted archives | Archive tokens, leases, and periodic dispatch | Expired archive-claim recovery test |
+| Detect file changes | Persisted SHA-256 plus verify/download checks | Integrity and tampering tests |
+| Export all outcomes | Asynchronous ZIP and complete CSV report | Archive content and background archive tests |
+| Use shared artifact storage | Local/S3 abstraction with managed transfers | S3 streamed-body cleanup test and live RustFS workflow |
+| Provide operational context | Structured job lifecycle and failure logs | JSON logging test |
+| Measure real operations | HTTP benchmark with CSV or JSON transport | `scripts/benchmark.py` and documented local results |
+| Support reproducible setup | Two Compose profiles, migrations, examples | Compose configuration validation and README command review |
+| Provide an evaluator-friendly interface | Built-in responsive operations console | Frontend route and static-asset integration test plus live HTTP workflow |
 
-## Requirement interpretation
+## Validation policy
 
-The API separates validation into two levels. Errors that make the overall job undefined, such as a missing certificate definition, malformed recipient collection, empty recipient list, or oversized request, return HTTP 422 and do not create a job. Errors confined to a recipient, such as a missing or invalid name or email, create a failed recipient record while the remaining recipients continue.
+Errors that make the overall job undefined return HTTP 422 without creating work. These include missing certificate details, an invalid date, an empty recipient collection, malformed JSON, or invalid CSV headers. Errors confined to one recipient create a failed recipient row while valid recipients continue.
 
-Background generation is an assignment-appropriate in-process mechanism. A bounded worker pool renders independent PDFs concurrently, while one coordinator persists batch outcomes to avoid concurrent SQLite writers within a job. Startup reconciliation resumes persisted incomplete jobs, but the processor is not a distributed queue and the SQLite/local-storage deployment remains single-instance. Generated PDF bytes remain on disk; the database stores metadata, checksums, and relative paths rather than binary objects.
+## Scalability policy
+
+The JSON cap is a request-safety control, not the service's capacity model. Large jobs use streaming CSV, with zero meaning no application-level CSV row cap. The distributed profile scales rendering by adding workers that claim bounded, non-overlapping PostgreSQL batches. Real capacity remains finite and must be established by load tests against the intended database, broker, object store, and worker resources.

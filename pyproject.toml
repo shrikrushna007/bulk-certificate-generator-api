@@ -4,14 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bulk-certificate-generator"
-version = "1.1.0"
-description = "A reliable FastAPI backend for bulk PDF certificate generation and job tracking."
+version = "2.0.0"
+description = "A scalable FastAPI backend for distributed bulk PDF certificate generation."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "alembic>=1.14,<2.0",
+    "boto3>=1.42,<2.0",
+    "celery[redis]>=5.6,<6.0",
     "fastapi>=0.115,<1.0",
+    "psycopg[binary]>=3.2,<4.0",
     "pydantic-settings>=2.6,<3.0",
+    "python-multipart>=0.0.20,<1.0",
     "reportlab>=4.2,<5.0",
     "sqlalchemy>=2.0,<3.0",
     "uvicorn[standard]>=0.32,<1.0",
@@ -28,6 +32,9 @@ dev = [
 
 [tool.setuptools.packages.find]
 include = ["app*"]
+
+[tool.setuptools.package-data]
+app = ["web/*"]
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-markers"

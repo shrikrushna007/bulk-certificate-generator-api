@@ -35,6 +35,15 @@ class JobStatus(StrEnum):
 
 class CertificateStatus(StrEnum):
     PENDING = "PENDING"
+    PROCESSING = "PROCESSING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
+class ArchiveStatus(StrEnum):
+    NOT_REQUESTED = "NOT_REQUESTED"
+    PENDING = "PENDING"
+    PROCESSING = "PROCESSING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
 
@@ -50,6 +59,7 @@ class CertificateJob(Base):
         ),
         Index("ix_certificate_jobs_status", "status"),
         Index("ix_certificate_jobs_created_at", "created_at"),
+        Index("ix_certificate_jobs_dispatch", "status", "last_dispatched_at"),
         Index(
             "ux_certificate_jobs_idempotency_key_hash",
             "idempotency_key_hash",
@@ -75,6 +85,21 @@ class CertificateJob(Base):
     )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_dispatched_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    archive_status: Mapped[ArchiveStatus] = mapped_column(
+        Enum(ArchiveStatus, native_enum=False, length=32),
+        default=ArchiveStatus.NOT_REQUESTED,
+        server_default=ArchiveStatus.NOT_REQUESTED.value,
+        nullable=False,
+    )
+    archive_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    archive_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    archive_claim_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    archive_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     certificates: Mapped[list[CertificateRecord]] = relationship(
         back_populates="job",
@@ -97,6 +122,12 @@ class CertificateRecord(Base):
     __table_args__ = (
         UniqueConstraint("job_id", "recipient_index", name="uq_certificate_job_recipient_index"),
         Index("ix_certificate_records_job_status", "job_id", "status"),
+        Index(
+            "ix_certificate_records_claimable",
+            "job_id",
+            "status",
+            "lease_expires_at",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
@@ -114,6 +145,13 @@ class CertificateRecord(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     file_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    claim_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now

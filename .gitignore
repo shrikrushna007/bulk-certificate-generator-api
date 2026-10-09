@@ -13,6 +13,7 @@ venv/
 .env
 .env.*
 !.env.example
+!.env.distributed.example
 data/
 *.db
 *.sqlite
@@ -30,4 +31,3 @@ dist/
 # Operating systems
 .DS_Store
 Thumbs.db
-

@@ -4,9 +4,12 @@ services:
     ports:
       - "8000:8000"
     environment:
+      PROCESSING_MODE: inline
       DATABASE_URL: sqlite:////app/data/certificates.db
+      STORAGE_BACKEND: local
       STORAGE_DIR: /app/data/certificates
       MAX_RECIPIENTS: ${MAX_RECIPIENTS:-500}
+      MAX_CSV_RECIPIENTS: ${MAX_CSV_RECIPIENTS:-0}
       RENDER_WORKERS: ${RENDER_WORKERS:-4}
       PROCESSING_BATCH_SIZE: ${PROCESSING_BATCH_SIZE:-100}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}

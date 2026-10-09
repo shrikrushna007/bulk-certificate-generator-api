@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Create, monitor, and download bulk certificate jobs.">
+    <title>CertFlow</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="CertFlow home">
+        <span class="brand-mark" aria-hidden="true">CF</span><span>CertFlow</span>
+      </a>
+      <div class="service-status" aria-live="polite">
+        <span id="health-dot" class="health-dot"></span><span id="health-label">Checking service</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <p class="eyebrow">Bulk certificate operations</p>
+        <h1>Generate every certificate with a clear outcome.</h1>
+        <p class="hero-copy">Submit recipient data, monitor generation progress, inspect individual failures, and download verified PDF certificates from one workspace.</p>
+      </section>
+
+      <nav class="tabs" aria-label="Workspace views">
+        <button class="tab active" type="button" data-view="create">Create job</button>
+        <button class="tab" type="button" data-view="monitor">Monitor job</button>
+      </nav>
+
+      <section id="create-view" class="view active" aria-labelledby="create-heading">
+        <div class="section-heading">
+          <div><p class="section-kicker">New generation job</p><h2 id="create-heading">Certificate details</h2></div>
+          <div class="mode-switch" role="group" aria-label="Recipient input mode">
+            <button id="json-mode" class="mode-button active" type="button">Recipient list</button>
+            <button id="csv-mode" class="mode-button" type="button">CSV upload</button>
+          </div>
+        </div>
+
+        <form id="job-form" novalidate>
+          <div class="form-grid">
+            <label>Certificate title<input id="certificate-title" maxlength="200" required placeholder="Advanced Backend Engineering"></label>
+            <label>Issuing organization<input id="issuing-organization" maxlength="200" required placeholder="AEREO Learning"></label>
+            <label>Issue date<input id="issue-date" type="date" required></label>
+            <label>Idempotency key<input id="idempotency-key" maxlength="255" placeholder="enrollment-2026-cohort-a"><span class="field-help">Reuse this key only when retrying the same request.</span></label>
+          </div>
+
+          <div id="recipient-list-panel" class="recipient-panel">
+            <div class="panel-heading">
+              <div><h3>Recipients</h3><p>Add recipients individually. Invalid rows are recorded without stopping valid rows.</p></div>
+              <button id="add-recipient" class="button secondary" type="button">Add recipient</button>
+            </div>
+            <div id="recipient-rows" class="recipient-rows"></div>
+          </div>
+
+          <div id="csv-panel" class="recipient-panel hidden">
+            <label class="upload-area" for="csv-file">
+              <span class="upload-icon" aria-hidden="true">CSV</span><strong>Choose a UTF-8 CSV file</strong>
+              <span>Required column: name. Optional column: email.</span>
+              <input id="csv-file" type="file" accept=".csv,text/csv">
+            </label>
+            <p id="selected-file" class="selected-file">No file selected</p>
+          </div>
+
+          <div id="form-message" class="message hidden" role="alert"></div>
+          <div class="form-actions">
+            <button id="submit-job" class="button primary" type="submit"><span class="button-label">Create generation job</span><span class="spinner hidden" aria-hidden="true"></span></button>
+          </div>
+        </form>
+      </section>
+
+      <section id="monitor-view" class="view" aria-labelledby="monitor-heading">
+        <div class="section-heading monitor-heading">
+          <div><p class="section-kicker">Job operations</p><h2 id="monitor-heading">Generation progress</h2></div>
+          <form id="job-lookup" class="job-lookup"><label class="sr-only" for="job-id">Job ID</label><input id="job-id" placeholder="Enter job ID" autocomplete="off"><button class="button secondary" type="submit">Load</button></form>
+        </div>
+
+        <div id="empty-state" class="empty-state">
+          <div class="empty-icon" aria-hidden="true">01</div><h3>No job selected</h3><p>Create a job or enter an existing job ID to view its progress.</p>
+        </div>
+
+        <div id="job-dashboard" class="hidden">
+          <div class="job-summary">
+            <div>
+              <div class="job-title-line"><h3 id="job-title">Certificate job</h3><span id="job-status" class="status-badge">PENDING</span></div>
+              <p id="job-metadata" class="job-metadata"></p>
+              <p class="job-id-line">Job ID <code id="display-job-id"></code><button id="copy-job-id" class="text-button" type="button">Copy</button></p>
+            </div>
+            <div class="summary-actions"><button id="refresh-job" class="button secondary" type="button">Refresh</button><button id="request-archive" class="button primary" type="button">Prepare ZIP</button></div>
+          </div>
+
+          <div class="progress-section">
+            <div class="progress-labels"><span>Overall progress</span><strong id="progress-percentage">0%</strong></div>
+            <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100"><div id="progress-bar" class="progress-bar"></div></div>
+          </div>
+
+          <div class="metric-grid">
+            <article class="metric-card"><span>Total</span><strong id="total-count">0</strong></article>
+            <article class="metric-card success"><span>Generated</span><strong id="success-count">0</strong></article>
+            <article class="metric-card failure"><span>Failed</span><strong id="failure-count">0</strong></article>
+            <article class="metric-card pending"><span>Pending</span><strong id="pending-count">0</strong></article>
+          </div>
+
+          <div id="archive-message" class="archive-message hidden" aria-live="polite"></div>
+
+          <div class="results-header">
+            <div><h3>Recipient outcomes</h3><p>Results are ordered by the submitted recipient position.</p></div>
+            <label class="filter-label">Filter<select id="status-filter"><option value="ALL">All outcomes</option><option value="COMPLETED">Generated</option><option value="FAILED">Failed</option><option value="PENDING">Pending</option><option value="PROCESSING">Processing</option></select></label>
+          </div>
+
+          <div class="table-shell">
+            <table><thead><tr><th scope="col">Recipient</th><th scope="col">Email</th><th scope="col">Status</th><th scope="col">Result</th><th scope="col" class="action-column">Action</th></tr></thead><tbody id="recipient-results"></tbody></table>
+          </div>
+          <div class="pagination"><span id="page-summary">No results</span><div><button id="previous-page" class="button secondary compact" type="button">Previous</button><button id="next-page" class="button secondary compact" type="button">Next</button></div></div>
+        </div>
+      </section>
+    </main>
+
+    <footer><span>CertFlow operations console</span><a href="/docs">API documentation</a></footer>
+  </body>
+</html>

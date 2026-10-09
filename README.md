@@ -1,77 +1,84 @@
 # CertFlow — Bulk Certificate Generation API
 
-Bulk Certificate Generator API is a FastAPI service that accepts one job containing multiple recipients, generates an individual PDF certificate for every valid recipient, records recipient-level outcomes, and exposes job progress and certificate downloads.
-
-The design favors a self-contained local setup: SQLite stores job metadata and ReportLab writes PDFs to local file storage. Invalid recipients and rendering failures are isolated so they do not prevent other certificates in the same job from completing. Idempotent submission, startup recovery, integrity metadata, and bulk export cover common operational failure modes without introducing external infrastructure.
+CertFlow is a FastAPI service for bulk PDF certificate generation with persistent job tracking, recipient-level failure isolation, idempotent submissions, integrity checks, and ZIP/CSV exports. It offers a self-contained SQLite profile for evaluation and a distributed profile using PostgreSQL, Celery, Redis, and S3-compatible object storage.
 
 ## Features
 
-- Bulk job creation with HTTP 202 responses
+- JSON bulk submission and memory-bounded CSV import
+- Built-in responsive operations console with no separate frontend deployment
+- HTTP 202 job creation with polling and paginated outcomes
+- Recipient-level validation and render-failure isolation
+- Professional ReportLab PDF template with long-name handling
 - Idempotent retries through the `Idempotency-Key` header
-- Request-level and recipient-level validation
-- A predefined, landscape PDF certificate template
-- Persistent job status, counters, timestamps, and recipient outcomes
-- `PENDING`, `PROCESSING`, `COMPLETED`, `PARTIALLY_COMPLETED`, and `FAILED` job states
-- Startup recovery for jobs interrupted by a process restart
-- SHA-256 integrity metadata and on-demand certificate verification
-- ZIP export containing successful PDFs and a full CSV outcome report
-- Structured JSON logs with job IDs, counts, durations, and failure context
-- Job-scoped certificate downloads with cross-job access protection
-- UUID-based filenames and storage path confinement
-- Consistent safe JSON errors without stack-trace disclosure
-- Alembic migrations, Docker configuration, automated tests, Ruff, and GitHub Actions CI
+- Persistent progress counters and terminal job states
+- SHA-256 integrity metadata and verification endpoint
+- Asynchronous ZIP export with a complete CSV outcome report
+- Lease-based distributed work claiming and interrupted-work recovery
+- Structured logs containing job IDs, durations, counts, and errors
+- Alembic migrations, pytest coverage, Ruff, Docker, and CI
 
-## Technology stack
+## Deployment profiles
 
-- Python 3.11+
-- FastAPI and Pydantic v2
-- SQLAlchemy 2.x and SQLite
-- Alembic
-- ReportLab
-- pytest, FastAPI TestClient, httpx, and pypdf
-- Ruff
-- Docker and Docker Compose
+### Local profile
+
+The default profile uses SQLite, local files, FastAPI background tasks, and a bounded render pool. It has no external service dependencies and is the fastest way to evaluate the API. It is deliberately single-instance because SQLite serializes writes and local files are not shared between hosts.
+
+### Distributed profile
+
+The optional distributed profile uses:
+
+- PostgreSQL for shared job and recipient state
+- Redis as the Celery broker
+- Multiple Celery workers for PDF rendering
+- S3-compatible storage for PDFs and archives
+- Celery Beat for expired-lease recovery
+
+Workers claim small recipient batches with row locks and `SKIP LOCKED`. Each claim has a token and expiration time. A stale worker cannot overwrite a later successful attempt because its database update must still own the matching token. Attempt-specific object keys also prevent concurrent attempts from overwriting each other's artifacts.
+
+This architecture removes the fixed capacity of a single application process, but it does not imply infinite capacity. Maximum practical volume depends on PostgreSQL sizing, broker throughput, object storage, worker count, disk and network bandwidth, retention policy, and operational limits. Large submissions should use CSV import; the JSON endpoint intentionally retains a configurable request-size guard.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    Client --> API[FastAPI routes and schemas]
-    API --> Jobs[Job service]
-    Jobs --> Idempotency[Idempotency checks]
-    Jobs --> DB[(SQLite)]
-    API --> Background[FastAPI background task]
-    Background --> Processor[Job processor]
-    DB --> Recovery[Startup recovery]
-    Recovery --> Processor
-    Processor --> Pool[Bounded render worker pool]
-    Pool --> Renderer[ReportLab renderer]
-    Processor --> DB
-    Renderer --> Storage[(Local PDF storage)]
-    API --> Storage
-    API --> Archive[ZIP and CSV exporter]
-    Archive --> Storage
+    Client --> API[FastAPI API]
+    API --> DB[(PostgreSQL)]
+    API --> Broker[(Redis)]
+    Broker --> W1[Celery worker]
+    Broker --> W2[Celery worker]
+    Broker --> WN[Celery worker N]
+    W1 --> DB
+    W2 --> DB
+    WN --> DB
+    W1 --> Store[(S3-compatible object storage)]
+    W2 --> Store
+    WN --> Store
+    Beat[Celery Beat] --> Broker
+    API --> Store
 ```
 
-HTTP routes validate and translate requests but do not contain certificate-generation logic. `JobService` owns job persistence and idempotency, `JobProcessor` coordinates recovery, an application-wide bounded render pool, and batched status updates, `CertificateRenderer` owns the single PDF design, and `CertificateStorage` confines all artifact paths beneath the configured storage root. Only each job coordinator writes its results, avoiding concurrent SQLite writers within a job while the global pool prevents thread growth as jobs arrive.
+The API validates and persists work before dispatch. `JobService` owns creation and idempotency; `DistributedJobProcessor` owns claims, rendering, and outcome persistence; `ArchiveProcessor` builds recoverable exports; `CertificateRenderer` owns the PDF design; and the storage abstraction supports either a confined local directory or S3-compatible storage.
 
 ## Project structure
 
 ```text
 .
 |-- app/
-|   |-- api/                 # Routes and FastAPI dependencies
-|   |-- core/                # Configuration and logging
-|   |-- db/                  # SQLAlchemy base, models, and sessions
+|   |-- api/                 # HTTP routes and dependencies
+|   |-- core/                # Settings and logging
+|   |-- db/                  # SQLAlchemy models and sessions
 |   |-- schemas/             # Pydantic request and response models
-|   |-- services/            # Validation, processing, rendering, and storage
-|   `-- main.py              # Application factory and exception handlers
-|-- migrations/              # Alembic environment and schema revisions
-|-- sample_requests/         # Copy-ready API payloads
-|-- scripts/                 # Reproducible real-system benchmark
-|-- tests/                   # Isolated API and service integration tests
-|-- .env.example
-|-- compose.yaml
+|   |-- services/            # Jobs, rendering, storage, archives, dispatch
+|   |-- web/                 # HTML, CSS, and JavaScript operations console
+|   |-- celery_app.py        # Celery configuration and recovery schedule
+|   |-- tasks.py             # Distributed worker entry points
+|   `-- main.py              # FastAPI application factory
+|-- migrations/              # Alembic revisions
+|-- sample_requests/         # JSON and CSV examples
+|-- scripts/benchmark.py     # Real HTTP/database/render benchmark
+|-- tests/                   # Unit and integration tests
+|-- compose.yaml             # Self-contained local profile
+|-- compose.distributed.yaml # Distributed local stack
 |-- Dockerfile
 |-- pyproject.toml
 `-- REQUIREMENTS_CHECKLIST.md
@@ -79,22 +86,30 @@ HTTP routes validate and translate requests but do not contain certificate-gener
 
 ## Data model
 
-`certificate_jobs` stores certificate-wide data, lifecycle status, counters, timestamps, a hashed idempotency key, and a canonical request hash. The unique key hash prevents duplicate job creation. `certificate_records` stores one row per submitted recipient, including its stable input order, validation or generation outcome, safe error message, relative PDF path, and SHA-256 digest. A foreign key with cascade deletion associates records with their job, and a unique constraint prevents duplicate recipient positions within one job.
+`certificate_jobs` stores certificate-wide fields, lifecycle state, counters, timestamps, idempotency hashes, dispatch timestamps, and archive state. `certificate_records` stores one row per recipient with its stable input order, validation or rendering outcome, object key, SHA-256 digest, claim token, lease expiration, and attempt count.
 
-PDF data is not stored in SQLite. Files use generated job and certificate UUIDs, so duplicate or filename-like recipient names cannot collide or control filesystem paths.
+Constraints prevent negative or inconsistent counters, a unique index protects idempotency keys, and a unique `(job_id, recipient_index)` constraint preserves input identity. PDF bytes remain in file or object storage instead of the relational database.
 
-## API endpoints
+## API
 
-| Method | Path | Purpose | Success |
-|---|---|---|---|
-| `GET` | `/health` | Liveness check | `200` |
-| `POST` | `/api/v1/jobs` | Create a bulk certificate job | `202` |
-| `GET` | `/api/v1/jobs/{job_id}` | Read progress and paginated recipient outcomes | `200` |
-| `GET` | `/api/v1/jobs/{job_id}/archive` | Download successful PDFs and a CSV report as ZIP | `200` |
-| `GET` | `/api/v1/jobs/{job_id}/certificates/{certificate_id}` | Download a completed PDF | `200` |
-| `GET` | `/api/v1/jobs/{job_id}/certificates/{certificate_id}/verify` | Compare a PDF with its recorded SHA-256 digest | `200` |
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/health` | Liveness check |
+| `POST` | `/api/v1/jobs` | Submit a JSON job |
+| `POST` | `/api/v1/jobs/import` | Stream a CSV job upload |
+| `GET` | `/api/v1/jobs/{job_id}` | Read progress and paginated outcomes |
+| `POST` | `/api/v1/jobs/{job_id}/archive` | Request ZIP generation |
+| `GET` | `/api/v1/jobs/{job_id}/archive` | Download a completed ZIP |
+| `GET` | `/api/v1/jobs/{job_id}/certificates/{certificate_id}` | Download a PDF |
+| `GET` | `/api/v1/jobs/{job_id}/certificates/{certificate_id}/verify` | Verify the stored checksum |
 
-Interactive OpenAPI documentation is available at `http://localhost:8000/docs` while the application is running.
+Interactive OpenAPI documentation is available at `http://localhost:8000/docs`.
+
+## Web interface
+
+Open `http://localhost:8000/` after starting either deployment profile. The responsive operations console uses the same origin as the API and therefore requires no CORS configuration or separate Node service. It supports recipient-list and CSV submissions, optional idempotency keys, automatic status polling, progress and failure inspection, paginated outcomes, individual PDF downloads, and asynchronous ZIP requests.
+
+The interface is implemented with semantic HTML, CSS, and browser JavaScript. User-provided values are inserted with DOM text nodes rather than HTML interpolation. The API remains the source of truth, so every operation available through the interface can also be scripted through the documented endpoints.
 
 ## Local development
 
@@ -102,81 +117,126 @@ Interactive OpenAPI documentation is available at `http://localhost:8000/docs` w
 
 - Python 3.11 or newer
 - Git
-- Docker Desktop or another Docker-compatible runtime only for the container workflow
+- Docker Desktop only for container workflows
 
-### Install
+### Installation
 
-On macOS or Linux:
+Windows PowerShell:
+
+```powershell
+py -3.11 -m venv .venv
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -e ".[dev]"
+alembic upgrade head
+uvicorn app.main:app --reload
+```
+
+macOS or Linux:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 pip install -e ".[dev]"
-```
-
-On Windows PowerShell:
-
-```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -e ".[dev]"
-```
-
-No environment variables are required for local development. Copy `.env.example` to `.env` only when overriding defaults:
-
-```bash
-cp .env.example .env
-```
-
-PowerShell equivalent:
-
-```powershell
-Copy-Item .env.example .env
-```
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `APP_ENV` | No | `development` | Runtime environment label |
-| `DATABASE_URL` | No | `sqlite:///./data/certificates.db` | SQLAlchemy database URL |
-| `STORAGE_DIR` | No | `./data/certificates` | Root directory for generated PDFs |
-| `MAX_RECIPIENTS` | No | `500` | Maximum recipients accepted in one job |
-| `RENDER_WORKERS` | No | `4` | Maximum PDFs rendered concurrently across the application |
-| `PROCESSING_BATCH_SIZE` | No | `100` | Outcomes persisted in each database transaction |
-| `LOG_LEVEL` | No | `INFO` | Python logging level |
-| `LOG_FORMAT` | No | `json` | `json` for structured logs or `text` for local readability |
-
-Apply the database migration:
-
-```bash
 alembic upgrade head
-```
-
-Start one application worker:
-
-```bash
 uvicorn app.main:app --reload
 ```
 
-For a production-style local command, omit `--reload`:
+No environment variables are required for this profile. Copy `.env.example` to `.env` only to override defaults.
+
+### Local Docker profile
 
 ```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+docker compose up --build
 ```
 
-## Complete API workflow
+The API is exposed on port 8000. SQLite and generated files persist in the `certificate_data` volume.
 
-Create a job with the included sample request:
+## Distributed local stack
+
+The distributed Compose file requires locally chosen PostgreSQL and object-storage credentials. Do not commit the resulting file. The local stack uses RustFS through the standard S3 API; production can use AWS S3 without changing application code.
+
+```powershell
+Copy-Item .env.distributed.example .env.distributed
+```
+
+Edit `.env.distributed` and replace every `replace-with-...` value. `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` are credentials you choose for the local object-storage container.
+
+Start the services:
+
+```bash
+docker compose --env-file .env.distributed -f compose.distributed.yaml up --build
+```
+
+Scale workers independently of the API:
+
+```bash
+docker compose --env-file .env.distributed -f compose.distributed.yaml up -d --scale worker=4
+```
+
+The API is available on port 8000 and the object-storage console on port 9001. Run exactly one Beat service; multiple schedulers would enqueue duplicate periodic recovery tasks. Duplicate task delivery is safe at the recipient layer, but unnecessary scheduler duplication wastes work.
+
+Stop the stack without deleting its data:
+
+```bash
+docker compose --env-file .env.distributed -f compose.distributed.yaml down
+```
+
+Add `-v` only when intentionally deleting PostgreSQL, Redis, and object-storage volumes.
+
+## Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PROCESSING_MODE` | `inline` | `inline` or `distributed` |
+| `DATABASE_URL` | SQLite URL | SQLAlchemy connection URL |
+| `STORAGE_BACKEND` | `local` | `local` or `s3` |
+| `STORAGE_DIR` | `./data/certificates` | Local artifact root |
+| `MAX_RECIPIENTS` | `500` | JSON request recipient cap |
+| `MAX_CSV_RECIPIENTS` | `0` | CSV row cap; zero means no application cap |
+| `RENDER_WORKERS` | `4` | Render threads in each process |
+| `PROCESSING_BATCH_SIZE` | `100` | Rows claimed or persisted per batch |
+| `DISTRIBUTED_JOB_PARALLELISM` | `4` | Queue tasks dispatched per job |
+| `CLAIM_TIMEOUT_SECONDS` | `300` | Lease duration before recovery eligibility |
+| `CELERY_BROKER_URL` | local Redis URL | Celery broker connection |
+| `S3_BUCKET` | `certflow` | Artifact bucket |
+| `S3_REGION` | `us-east-1` | S3 region |
+| `S3_ENDPOINT_URL` | empty | Optional S3-compatible endpoint |
+| `S3_ACCESS_KEY_ID` | empty | Optional explicit local access key |
+| `S3_SECRET_ACCESS_KEY` | empty | Optional explicit local secret key |
+| `S3_AUTO_CREATE_BUCKET` | `false` | Create a missing bucket at startup |
+| `LOG_LEVEL` | `INFO` | Python log level |
+| `LOG_FORMAT` | `json` | `json` or `text` |
+
+Distributed mode rejects SQLite and local storage at startup. When explicit S3 credentials are omitted, boto3 uses its standard credential provider chain. Secrets must not be placed in source files or logs.
+
+## API workflow
+
+Submit the sample JSON request:
 
 ```bash
 curl -i -X POST http://localhost:8000/api/v1/jobs \
   -H "Content-Type: application/json" \
-  -H "Idempotency-Key: enrollment-import-2026-10-08" \
+  -H "Idempotency-Key: enrollment-import-2026-10-09" \
   --data @sample_requests/create_job.json
 ```
 
-Example response:
+For large jobs, stream CSV instead:
+
+```bash
+curl -i -X POST http://localhost:8000/api/v1/jobs/import \
+  -H "Idempotency-Key: enrollment-csv-2026-10-09" \
+  -F "title=Advanced Backend Engineering" \
+  -F "issuing_organization=AEREO Learning" \
+  -F "issue_date=2026-10-09" \
+  -F "recipients=@sample_requests/recipients.csv;type=text/csv"
+```
+
+CSV must be UTF-8 with a required `name` column and optional `email` column. It is inspected and inserted in bounded chunks instead of materializing every recipient in application memory.
+
+Example creation response:
 
 ```json
 {
@@ -188,206 +248,120 @@ Example response:
 }
 ```
 
-Repeating the same payload with the same key returns the original job and sets `idempotency_replayed` and the `Idempotency-Replayed` response header to `true`. Reusing a key with a different payload returns HTTP 409. Keys are stored only as SHA-256 hashes.
+Repeating the same body and idempotency key returns the original job. Reusing the key with different content returns HTTP 409. Only a SHA-256 hash of the key is stored.
 
-Poll job status using the returned URL:
-
-```bash
-curl http://localhost:8000/api/v1/jobs/03bd7f9c-0c5d-42e3-8f34-6d86256c4693
-```
-
-For frequent progress polling, omit recipient outcomes to keep the response small:
+Poll a compact status response:
 
 ```bash
 curl "http://localhost:8000/api/v1/jobs/03bd7f9c-0c5d-42e3-8f34-6d86256c4693?include_recipients=false"
 ```
 
-Recipient outcomes are ordered by their original input position and paginated with `recipient_offset` and `recipient_limit`. The default page contains 100 outcomes and the maximum page size is 500:
+Recipient details are paginated with `recipient_offset` and `recipient_limit`; the maximum page size is 500.
+
+Download and verify one certificate:
 
 ```bash
-curl "http://localhost:8000/api/v1/jobs/03bd7f9c-0c5d-42e3-8f34-6d86256c4693?recipient_offset=100&recipient_limit=100"
+curl -o certificate.pdf http://localhost:8000/api/v1/jobs/JOB_ID/certificates/CERTIFICATE_ID
+curl http://localhost:8000/api/v1/jobs/JOB_ID/certificates/CERTIFICATE_ID/verify
 ```
 
-A completed recipient includes its certificate ID and download URL:
-
-```json
-{
-  "job_id": "03bd7f9c-0c5d-42e3-8f34-6d86256c4693",
-  "status": "COMPLETED",
-  "certificate_title": "Advanced Backend Engineering",
-  "issuing_organization": "AEREO Learning",
-  "issue_date": "2026-10-08",
-  "total_recipients": 2,
-  "successful_generations": 2,
-  "failed_generations": 0,
-  "pending_generations": 0,
-  "progress_percentage": 100.0,
-  "created_at": "2026-10-08T13:30:00Z",
-  "started_at": "2026-10-08T13:30:00Z",
-  "completed_at": "2026-10-08T13:30:01Z",
-  "recipients": [
-    {
-      "certificate_id": "86f8f39b-a37a-4411-90df-cc59cd201b66",
-      "recipient_index": 0,
-      "recipient_name": "Aarav Sharma",
-      "recipient_email": "aarav.sharma@example.com",
-      "status": "COMPLETED",
-      "error_message": null,
-      "download_url": "/api/v1/jobs/03bd7f9c-0c5d-42e3-8f34-6d86256c4693/certificates/86f8f39b-a37a-4411-90df-cc59cd201b66",
-      "sha256": "fd9d4d93115213acb37b9cc497afc1efb2d95a7793b09b92310a9b39d254fc9a"
-    }
-  ],
-  "recipient_page": {
-    "offset": 0,
-    "limit": 100,
-    "returned": 2,
-    "total": 2
-  }
-}
-```
-
-Download a certificate:
+Request an archive, poll the job until `archive_status` is `COMPLETED`, then download it:
 
 ```bash
-curl -o certificate.pdf \
-  http://localhost:8000/api/v1/jobs/03bd7f9c-0c5d-42e3-8f34-6d86256c4693/certificates/86f8f39b-a37a-4411-90df-cc59cd201b66
+curl -X POST http://localhost:8000/api/v1/jobs/JOB_ID/archive
+curl -o certificates.zip http://localhost:8000/api/v1/jobs/JOB_ID/archive
 ```
 
-Verify stored file integrity or download the complete job archive:
+The ZIP contains successful PDFs under `certificates/` and `report.csv` containing every recipient and any failure reason.
 
-```bash
-curl http://localhost:8000/api/v1/jobs/03bd7f9c-0c5d-42e3-8f34-6d86256c4693/certificates/86f8f39b-a37a-4411-90df-cc59cd201b66/verify
+## Validation and failure behavior
 
-curl -o certificates.zip \
-  http://localhost:8000/api/v1/jobs/03bd7f9c-0c5d-42e3-8f34-6d86256c4693/archive
-```
+Missing certificate fields, invalid dates, an empty recipient collection, and malformed request envelopes are request-level errors and return HTTP 422 without creating work. Recipient names and emails are evaluated independently. A bad recipient becomes a failed outcome while valid recipients continue.
 
-The archive contains every successful PDF under `certificates/` and `report.csv` with all successful and failed recipients, error messages, checksums, and download URLs.
+Worker failures are contained by recipient batches. Completed rows remain committed, claimed rows become eligible after their leases expire, and the periodic recovery task redispatches unfinished jobs. Counters are updated only by the worker that still owns a claim token. Jobs finish as `COMPLETED`, `PARTIALLY_COMPLETED`, or `FAILED` only when all recipients have terminal outcomes.
 
-The identifiers above are illustrative. Use the values returned by the running API.
+Downloads return 404 for unknown or cross-job identifiers, 409 for unavailable or checksum-mismatched files, and 410 when metadata references a missing artifact. API responses never expose internal tracebacks.
 
-## Validation and partial failures
-
-The request envelope must contain a valid certificate definition and a non-empty recipient list within `MAX_RECIPIENTS`. Unknown fields, invalid dates, malformed recipient collections, and missing certificate-wide fields return HTTP 422 without creating a job.
-
-Recipient objects are evaluated independently. A missing, non-string, blank, control-character-containing, or over-200-character name fails that recipient. An optional email must be a plausible address no longer than 320 characters. Invalid recipients are visible in job status with a safe failure message, while valid recipients continue processing. A job is `PARTIALLY_COMPLETED` when at least one certificate succeeds and at least one fails.
-
-## Error responses
-
-Errors use a consistent envelope:
-
-```json
-{
-  "error": {
-    "code": "certificate_not_found",
-    "message": "The requested certificate does not belong to this job."
-  }
-}
-```
-
-The download endpoint returns `404` for unknown or cross-job identifiers, `409` when generation failed, remains incomplete, or fails its checksum, and `410` when the database references a completed artifact that is missing from storage. Archive generation returns `409` until processing is terminal and `410` if a required successful artifact is missing.
-
-## Tests and linting
+## Testing and linting
 
 ```bash
 ruff check .
 pytest -q
-```
-
-To include coverage:
-
-```bash
 pytest --cov=app --cov-report=term-missing
+alembic check
 ```
 
-Tests create an isolated temporary SQLite database and storage directory for each test. The 42-test suite exercises real HTTP endpoints, SQLAlchemy persistence, actual ReportLab output, PDF text extraction, idempotency, recovery, integrity tampering, and ZIP contents. A reliability test submits 100 recipients, injects one render failure, verifies 99 successes and one failure at 100% progress, and downloads all 99 successful PDFs.
-
-Recovery was also exercised against the Docker service by force-stopping it during a 5,000-recipient job. The persisted state showed 1,100 completed and 3,900 pending recipients at shutdown; startup reconciliation resumed the same job and finished with 5,000 successes, zero failures, and no pending records.
+Tests use isolated temporary databases and storage. They exercise the real API, ReportLab rendering, PDF text extraction, persistence, invalid recipients, one failure among 100 recipients, idempotency, restart recovery, distributed batch claims, archive leases, checksums, ZIP contents, and S3 response-stream cleanup.
 
 ## Reproducible benchmark
 
-The processor fetches pending recipients in bounded batches, renders each batch through one application-wide configurable thread pool, and writes all outcomes from that batch in one database transaction. Job creation also inserts recipient rows in bulk. SQLite uses WAL mode, normal synchronization, and a busy timeout to allow progress reads while generation is active.
-
-A benchmark script drives the running HTTP API and uses the real database, renderer, checksum calculation, and file storage:
+The benchmark calls a running service and exercises HTTP upload, database persistence, rendering, hashing, and storage. CSV is the default transport so the client and API do not build a large JSON recipient array.
 
 ```bash
 python scripts/benchmark.py --sizes 10 100 1000
+python scripts/benchmark.py --sizes 100000 --transport csv --max-wait 7200
 ```
 
-Set `MAX_RECIPIENTS` at least as high as the largest case before starting the service. The script uses a unique idempotency key per run and prints a Markdown table. Use `--json` for machine-readable output.
+Measured on the local SQLite Docker profile with four render workers and batch size 100:
 
-Measured on Docker Desktop on the development machine with four render workers and a batch size of 100:
-
-| Recipients | Request acceptance | Completion | Successful | Failed | Throughput |
+| Recipients | Acceptance | Completion | Successful | Failed | Throughput |
 |---:|---:|---:|---:|---:|---:|
 | 10 | 0.073 s | 0.230 s | 10 | 0 | 43.56 PDFs/s |
 | 100 | 0.079 s | 0.608 s | 100 | 0 | 164.53 PDFs/s |
 | 1,000 | 0.126 s | 5.204 s | 1,000 | 0 | 192.16 PDFs/s |
 | 5,000 | 0.334 s | 21.778 s | 5,000 | 0 | 229.59 PDFs/s |
 
-These are local measurements, not throughput guarantees. Results depend on CPU allocation, storage performance, template complexity, recipient data, and other host activity. The 5,000-recipient run was performed after integrity hashing was enabled.
+The distributed Compose profile was also measured on the same development machine with two
+Celery workers (two processes per worker), PostgreSQL, Redis, and RustFS:
 
-## Docker
+| Recipients | Acceptance | Completion | Successful | Failed | Throughput |
+|---:|---:|---:|---:|---:|---:|
+| 1,000 | 1.179 s | 23.359 s | 1,000 | 0 | 42.81 PDFs/s |
 
-Build and start the API:
+These are development-machine measurements, not capacity guarantees. Object storage and
+database overhead make this local distributed topology slower than the optimized inline run;
+its advantage is durable shared state and horizontal worker scaling rather than lower latency on
+one laptop.
 
-```bash
-docker compose up --build
-```
+### Live worker-loss exercise
 
-The container applies migrations before starting Uvicorn, runs as a non-root user, and persists the SQLite database and generated PDFs in the `certificate_data` volume.
-
-Compose forwards the processing settings from `.env`. For a deliberate 5,000-recipient local test, use values such as:
-
-```dotenv
-MAX_RECIPIENTS=5000
-RENDER_WORKERS=4
-PROCESSING_BATCH_SIZE=100
-```
-
-Increase `RENDER_WORKERS` only after measuring the host. More threads can reduce performance when CPU or storage is already saturated.
-
-Stop the service:
-
-```bash
-docker compose down
-```
-
-Add `-v` only when intentionally deleting the persistent Docker volume and all generated data.
+A 5,000-recipient CSV job was run with two Celery worker containers. One worker was stopped while
+the job was processing. The periodic recovery task reclaimed 200 expired recipient leases; all
+5,000 certificates completed successfully in 145.917 seconds with no failed or pending records.
+The temporary 30-second recovery lease used for this exercise was then restored to the configured
+default. This verifies the recovery mechanism, but it is not a high-availability or chaos-testing
+claim.
 
 ## Design decisions and trade-offs
 
-- **Idempotent submission:** A unique hash of the optional client key maps retries to one job. A canonical request hash detects accidental key reuse with different content. Keys currently have no expiration policy.
-- **In-process background execution with recovery:** FastAPI background tasks keep the create request responsive without adding Redis or a worker service. On startup, persisted `PENDING` and `PROCESSING` jobs are reconciled and remaining recipient records are processed. An atomic status claim prevents two in-process coordinators from starting the same pending job.
-- **Bounded parallel rendering:** Independent PDFs are rendered concurrently, while a single coordinator persists results. Each future captures its own failure, so one broken recipient does not cancel the batch.
-- **Batched commits:** Outcomes are committed once per configurable batch instead of once per certificate. A crash can leave rendered files whose pending records were not committed; recovery safely overwrites their deterministic identifier-based paths.
-- **SQLite and local storage:** They make evaluation simple and credential-free. WAL mode improves concurrent status reads, but SQLite still serializes writes and local files are not shared across hosts, so this deployment is intended for one application instance.
-- **Paginated status:** Lightweight summary polling avoids loading or serializing thousands of recipient records. Outcome pages remain available when detailed inspection is needed.
-- **Relative paths instead of PDF blobs:** The database remains small and queryable while the storage layer enforces a single trusted root.
-- **Integrity rather than authenticity:** SHA-256 detects modification or corruption relative to the database record. It is not a digital signature and does not prove who issued a certificate.
-- **Transient archive generation:** ZIP output uses a spooled temporary file and is not retained after the response. This avoids persistent duplicate artifacts but still consumes local disk space for large archives.
-- **Derived progress:** Pending count and percentage derive from persisted totals, successes, and failures, reducing the number of independently mutable counters.
+- **Two profiles:** The local profile minimizes evaluator setup. The distributed profile adds infrastructure only where shared state and horizontal workers require it.
+- **Streaming CSV:** Large request bodies are spooled by the framework and consumed as a stream. Database inserts use bounded batches, although job creation remains one transaction so a failed import cannot leave a partially created job.
+- **Lease-based claims:** PostgreSQL row locks allocate disjoint batches. Claim tokens fence stale attempts; expiration enables recovery after worker loss.
+- **At-least-once delivery:** Celery tasks may run more than once. Correctness comes from database state and fencing, not an assumption of exactly-once delivery.
+- **Bounded concurrency:** Worker processes and render threads are explicit controls. Increasing them beyond CPU, database, or storage capacity can reduce throughput.
+- **Attempt-specific objects:** A stale attempt writes a unique key and cannot replace the accepted file. Best-effort cleanup removes artifacts from rejected attempts.
+- **Asynchronous archives:** Distributed archives use their own leases and object keys because compressing a large job inside an API request would monopolize that process.
+- **Integrity, not authenticity:** SHA-256 detects corruption relative to stored metadata. It is not a digital signature and does not establish the issuer's identity.
 
 ## Known limitations
 
-- Recovery begins on restart, but the in-process queue does not provide delivery guarantees while the service is stopped. There is no independent worker or retry scheduler.
-- The local SQLite and filesystem design is intentionally single-instance and is not suitable for horizontal scaling or multiple Uvicorn workers.
-- Jobs that repeatedly fail due to a systemic renderer or storage problem require operator intervention; there is no configurable retry or dead-letter policy.
-- There is no authentication or authorization; deploy behind an appropriate access-control layer when certificates contain private data.
-- Generated files have no automatic retention or cleanup policy.
-- The predefined template uses ReportLab core fonts. Complex writing systems require a licensed Unicode font to be bundled and registered.
-- ZIP archives are created on demand rather than cached, so repeated large downloads repeat compression work.
-- Idempotency records do not expire automatically.
+- CSV ingestion is memory-bounded but synchronous and atomic; extremely large imports hold a database transaction open until all rows are inserted.
+- Every certificate still consumes CPU, database metadata, and object-storage capacity. Capacity planning and load testing are required for a target volume.
+- Celery recovery retries transient failures, but there is no operator-facing dead-letter queue or per-recipient manual retry endpoint.
+- There is no authentication, authorization, tenant isolation, cancellation, or retention scheduler.
+- Generated objects and idempotency records do not expire automatically.
+- The bundled ReportLab core fonts do not cover every writing system.
+- The Compose distributed profile is a local demonstration topology, not a highly available production deployment.
 
 ## Future improvements
 
-- Move execution to a durable queue with leases, retry backoff, and dead-letter handling when multi-instance operation is needed.
-- Move artifacts to object storage and use short-lived signed download URLs.
-- Add authentication, ownership checks, and audit events.
-- Add retention policies, job cancellation, explicit retries, idempotency-key expiration, and webhooks.
-- Bundle a broad Unicode font and add multilingual rendering tests.
-- Export metrics and traces for queue latency, per-batch render duration, recovery, and failure rates.
+- Stage very large CSV uploads in object storage and ingest them asynchronously in independently committed chunks.
+- Add Prometheus metrics and tracing for queue latency, claim duration, retries, and storage errors.
+- Add retention policies, cancellation, dead-letter inspection, and explicit retry controls.
+- Add signed download URLs, authentication, tenant ownership, and audit events.
+- Partition or archive old recipient rows after measuring PostgreSQL growth.
+- Bundle an appropriately licensed Unicode font and multilingual layout tests.
 
-## Implementation insights
+## Implementation insight
 
-The central reliability concern is not rendering a PDF; it is preserving accurate job state when requests are retried or processing stops midway through a batch. Separating request-level validation from recipient-level outcomes makes partial success explicit. Idempotent creation, persisted per-recipient state, startup reconciliation, bounded rendering concurrency, and a single database writer keep the behavior understandable and testable. Identifier-based storage also removes recipient input from the filesystem trust boundary.
+The principal reliability problem is maintaining correct state when requests repeat, workers overlap, and processes stop mid-batch. Persisted recipient state, idempotent creation, bounded claims, fencing tokens, lease recovery, and attempt-specific artifact keys make those failure modes explicit and testable. Horizontal scaling then becomes a controlled increase in worker capacity rather than a larger hard-coded request limit.

@@ -22,6 +22,19 @@ def test_health_check(client) -> None:
     assert response.json() == {"status": "ok"}
 
 
+def test_frontend_assets_are_served(client) -> None:
+    page = client.get("/")
+    stylesheet = client.get("/static/styles.css")
+    script = client.get("/static/app.js")
+
+    assert page.status_code == 200
+    assert "CertFlow" in page.text
+    assert stylesheet.status_code == 200
+    assert "--brand" in stylesheet.text
+    assert script.status_code == 200
+    assert 'fetch("/health")' in script.text
+
+
 def test_creates_and_completes_bulk_job(client, valid_payload) -> None:
     created, job = create_job(client, valid_payload)
 

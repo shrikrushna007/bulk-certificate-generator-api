@@ -5,7 +5,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.db.models import CertificateStatus, JobStatus
+from app.db.models import ArchiveStatus, CertificateStatus, JobStatus
 
 
 class RecipientInput(BaseModel):
@@ -87,6 +87,8 @@ class JobStatusResponse(BaseModel):
     created_at: datetime
     started_at: datetime | None
     completed_at: datetime | None
+    archive_status: ArchiveStatus
+    archive_download_url: str | None
     recipients: list[CertificateOutcomeResponse]
     recipient_page: RecipientPageResponse | None
 
@@ -97,3 +99,9 @@ class CertificateVerificationResponse(BaseModel):
     stored_sha256: str
     computed_sha256: str
     valid: bool
+
+
+class ArchiveRequestedResponse(BaseModel):
+    job_id: str
+    status: ArchiveStatus
+    download_url: str
