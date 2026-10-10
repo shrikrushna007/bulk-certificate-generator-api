@@ -14,7 +14,9 @@ venv/
 .env.*
 !.env.example
 !.env.distributed.example
+.elasticache/
 data/
+tmp/
 *.db
 *.sqlite
 *.sqlite3
@@ -24,6 +26,8 @@ uploads/
 # Build and tooling
 build/
 dist/
+cdk.out/
+cdk.context.json
 .idea/
 .vscode/
 *.log

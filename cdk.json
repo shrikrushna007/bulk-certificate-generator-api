@@ -1,0 +1,8 @@
+{
+  "app": "python -m infra.app",
+  "context": {
+    "@aws-cdk/core:validateAgainstDefaultRules": true,
+    "@aws-cdk/aws-ecs-patterns:removeDefaultDesiredCount": true,
+    "@aws-cdk/aws-rds:lowercaseDbIdentifier": true
+  }
+}

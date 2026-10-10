@@ -28,7 +28,7 @@ The default profile uses SQLite, local files, FastAPI background tasks, and a bo
 The optional distributed profile uses:
 
 - PostgreSQL for shared job and recipient state
-- Redis as the Celery broker
+- a Redis-compatible Celery broker: Redis locally or Valkey on AWS
 - Multiple Celery workers for PDF rendering
 - S3-compatible storage for PDFs and archives
 - Celery Beat for expired-lease recovery
@@ -43,7 +43,7 @@ This architecture removes the fixed capacity of a single application process, bu
 flowchart LR
     Client --> API[FastAPI API]
     API --> DB[(PostgreSQL)]
-    API --> Broker[(Redis)]
+    API --> Broker[(Redis or Valkey)]
     Broker --> W1[Celery worker]
     Broker --> W2[Celery worker]
     Broker --> WN[Celery worker N]
@@ -74,9 +74,11 @@ The API validates and persists work before dispatch. `JobService` owns creation 
 |   |-- tasks.py             # Distributed worker entry points
 |   `-- main.py              # FastAPI application factory
 |-- migrations/              # Alembic revisions
+|-- infra/                   # AWS CDK production infrastructure
 |-- sample_requests/         # JSON and CSV examples
 |-- scripts/benchmark.py     # Real HTTP/database/render benchmark
 |-- tests/                   # Unit and integration tests
+|-- cdk.json                 # CDK application configuration
 |-- compose.yaml             # Self-contained local profile
 |-- compose.distributed.yaml # Distributed local stack
 |-- Dockerfile
@@ -118,6 +120,7 @@ The interface is implemented with semantic HTML, CSS, and browser JavaScript. Us
 - Python 3.11 or newer
 - Git
 - Docker Desktop only for container workflows
+- Node.js 20 or newer only for AWS CDK workflows
 
 ### Installation
 
@@ -186,12 +189,66 @@ docker compose --env-file .env.distributed -f compose.distributed.yaml down
 
 Add `-v` only when intentionally deleting PostgreSQL, Redis, and object-storage volumes.
 
+## Managed AWS deployment
+
+The CDK stack in `infra/` provides a production-oriented distributed deployment in
+`ap-south-1`:
+
+- an internet-facing Application Load Balancer with HTTP-to-HTTPS redirection
+- two Fargate API tasks, two Fargate worker tasks, and one Celery Beat task
+- CPU-based scaling for API and worker services from two to three tasks
+- private, encrypted, Multi-AZ PostgreSQL on Amazon RDS
+- private, encrypted, Multi-AZ Valkey on Amazon ElastiCache
+- a private, versioned, KMS-encrypted S3 certificate bucket
+- Secrets Manager integration for generated database and broker credentials
+- encrypted CloudWatch logs, Container Insights, and CPU alarms
+- deletion protection, retained data resources, and CloudFormation termination protection
+
+The hosted demonstration is available at `https://certificates.shrikrushna.me`, with interactive
+API documentation at `https://certificates.shrikrushna.me/docs`.
+
+Install the infrastructure dependencies and synthesize the template:
+
+```powershell
+pip install -r infra/requirements.txt
+npx --yes aws-cdk@2.1144.0 synth
+```
+
+Deployment requires AWS CLI credentials, a bootstrapped CDK environment, and an issued ACM
+certificate in the target region. Supply the certificate through the CloudFormation parameter:
+
+```powershell
+npx --yes aws-cdk@2.1144.0 bootstrap aws://ACCOUNT_ID/ap-south-1
+npx --yes aws-cdk@2.1144.0 deploy CertFlowProduction `
+  --parameters CertificateArn=arn:aws:acm:ap-south-1:ACCOUNT_ID:certificate/CERTIFICATE_ID
+```
+
+After deployment, create a DNS CNAME from `certificates.shrikrushna.me` to the
+`LoadBalancerDnsName` stack output. The domain is explicit in the stack because this
+infrastructure describes the hosted demonstration environment.
+
+The stack places Fargate tasks in public subnets so they can reach AWS public service endpoints
+without a NAT gateway; their security group accepts application traffic only from the load
+balancer. PostgreSQL and Valkey remain in isolated subnets. A larger production environment can
+move tasks to private subnets and add VPC endpoints or managed egress at additional cost.
+
+AWS Free plan credits and Free Tier eligibility vary by account, region, and service. This stack
+creates always-on Multi-AZ resources and is not guaranteed to be free. Review AWS Pricing and
+Billing before deployment and remove unused compute resources promptly. Retained S3, KMS, log,
+and database snapshot resources require deliberate cleanup after stack deletion.
+
 ## Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `PROCESSING_MODE` | `inline` | `inline` or `distributed` |
 | `DATABASE_URL` | SQLite URL | SQLAlchemy connection URL |
+| `DATABASE_HOST` | empty | Optional managed PostgreSQL host; enables component URL construction |
+| `DATABASE_PORT` | `5432` | Managed PostgreSQL port |
+| `DATABASE_NAME` | empty | Required with `DATABASE_HOST` |
+| `DATABASE_USER` | empty | Required with `DATABASE_HOST` |
+| `DATABASE_PASSWORD` | empty | Required secret with `DATABASE_HOST` |
+| `DATABASE_SSL_MODE` | `prefer` | PostgreSQL TLS mode; AWS uses `require` |
 | `STORAGE_BACKEND` | `local` | `local` or `s3` |
 | `STORAGE_DIR` | `./data/certificates` | Local artifact root |
 | `MAX_RECIPIENTS` | `500` | JSON request recipient cap |
@@ -201,6 +258,11 @@ Add `-v` only when intentionally deleting PostgreSQL, Redis, and object-storage 
 | `DISTRIBUTED_JOB_PARALLELISM` | `4` | Queue tasks dispatched per job |
 | `CLAIM_TIMEOUT_SECONDS` | `300` | Lease duration before recovery eligibility |
 | `CELERY_BROKER_URL` | local Redis URL | Celery broker connection |
+| `CELERY_BROKER_HOST` | empty | Optional secret-injected Redis or Valkey host |
+| `CELERY_BROKER_PORT` | `6379` | Redis-compatible broker port |
+| `CELERY_BROKER_USERNAME` | empty | Broker ACL username |
+| `CELERY_BROKER_PASSWORD` | empty | Required secret with `CELERY_BROKER_HOST` |
+| `CELERY_BROKER_TLS` | `false` | Use TLS and certificate verification for the broker |
 | `S3_BUCKET` | `certflow` | Artifact bucket |
 | `S3_REGION` | `us-east-1` | S3 region |
 | `S3_ENDPOINT_URL` | empty | Optional S3-compatible endpoint |
@@ -331,6 +393,16 @@ the job was processing. The periodic recovery task reclaimed 200 expired recipie
 The temporary 30-second recovery lease used for this exercise was then restored to the configured
 default. This verifies the recovery mechanism, but it is not a high-availability or chaos-testing
 claim.
+
+### Managed deployment verification
+
+On 2026-10-10, the AWS stack completed successfully with two healthy API targets, two worker
+tasks, and one scheduler task. A live HTTPS request created a two-recipient job, both PDFs
+completed, and an immediate retry with the same idempotency key returned the original job. A
+downloaded PDF matched its stored SHA-256 checksum and rendered correctly. The asynchronous ZIP
+contained both PDFs and the complete CSV report, and the corresponding S3 objects reported
+SSE-KMS encryption. This smoke test verifies the deployed workflow; it is not a production load
+test.
 
 ## Design decisions and trade-offs
 

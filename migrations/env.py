@@ -7,6 +7,7 @@ from sqlalchemy import engine_from_config, make_url, pool
 from app.core.config import Settings
 from app.db import models  # noqa: F401
 from app.db.base import Base
+from app.migrate import escape_alembic_config_value
 
 config = context.config
 if config.config_file_name is not None:
@@ -16,7 +17,7 @@ database_url = Settings().database_url
 parsed_url = make_url(database_url)
 if parsed_url.drivername == "sqlite" and parsed_url.database not in {None, ":memory:"}:
     Path(parsed_url.database).parent.mkdir(parents=True, exist_ok=True)
-config.set_main_option("sqlalchemy.url", database_url)
+config.set_main_option("sqlalchemy.url", escape_alembic_config_value(database_url))
 target_metadata = Base.metadata
 
 

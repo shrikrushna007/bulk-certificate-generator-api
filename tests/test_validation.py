@@ -89,3 +89,32 @@ def test_invalid_email_is_an_individual_failure(client, valid_payload) -> None:
 def test_explicit_s3_credentials_must_be_complete() -> None:
     with pytest.raises(ValidationError, match="must be configured together"):
         Settings(s3_access_key_id="local-access-key")
+
+
+def test_component_database_settings_build_encoded_url() -> None:
+    settings = Settings(
+        database_host="database.internal",
+        database_name="certflow",
+        database_user="service user",
+        database_password="password/with:symbols",
+        database_ssl_mode="require",
+    )
+
+    assert settings.database_url == (
+        "postgresql+psycopg://service+user:password%2Fwith%3Asymbols@"
+        "database.internal:5432/certflow?sslmode=require"
+    )
+
+
+def test_component_broker_settings_build_tls_url() -> None:
+    settings = Settings(
+        celery_broker_host="cache.internal",
+        celery_broker_username="certflow app",
+        celery_broker_password="password/with:symbols",
+        celery_broker_tls=True,
+    )
+
+    assert settings.celery_broker_url == (
+        "rediss://certflow+app:password%2Fwith%3Asymbols@cache.internal:6379/0"
+        "?ssl_cert_reqs=required"
+    )

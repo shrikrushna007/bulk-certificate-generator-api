@@ -27,6 +27,7 @@ This checklist maps assignment and reliability requirements to implementation an
 | Measure real operations | HTTP benchmark with CSV or JSON transport | `scripts/benchmark.py` and documented local results |
 | Support reproducible setup | Two Compose profiles, migrations, examples | Compose configuration validation and README command review |
 | Provide an evaluator-friendly interface | Built-in responsive operations console | Frontend route and static-asset integration test plus live HTTP workflow |
+| Provide managed deployment infrastructure | AWS CDK stack for ALB, ECS, RDS, ElastiCache, S3, KMS, Secrets Manager, logs, and alarms | Successful CloudFormation deployment and live HTTPS workflow |
 
 ## Validation policy
 
