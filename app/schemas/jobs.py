@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import unicodedata
 from datetime import date, datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.db.models import ArchiveStatus, CertificateStatus, JobStatus
+from app.services.validation import contains_control_characters, is_supported_certificate_text
 
 
 class RecipientInput(BaseModel):
@@ -25,9 +27,13 @@ class CertificateDetailsInput(BaseModel):
     @field_validator("title", "issuing_organization")
     @classmethod
     def require_nonblank(cls, value: str) -> str:
-        normalized = " ".join(value.split())
+        if contains_control_characters(value):
+            raise ValueError("contains unsupported control characters")
+        normalized = " ".join(unicodedata.normalize("NFKC", value).split())
         if not normalized:
             raise ValueError("must not be blank")
+        if not is_supported_certificate_text(normalized):
+            raise ValueError("contains characters unsupported by the certificate template")
         return normalized
 
 

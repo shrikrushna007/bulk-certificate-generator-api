@@ -217,17 +217,28 @@ class DistributedJobProcessor:
                     issue_date=context.issue_date,
                     certificate_id=item.certificate_id,
                 )
+                sha256 = _sha256_file(destination)
+                self.storage.put_file(destination, key, "application/pdf")
             except Exception:
                 logger.exception(
-                    "Certificate rendering failed",
+                    "Certificate rendering or storage failed",
                     extra={
                         "job_id": context.job_id,
                         "certificate_id": item.certificate_id,
                     },
                 )
+                try:
+                    self.storage.delete(key)
+                except Exception:
+                    logger.warning(
+                        "Could not remove a failed certificate artifact",
+                        extra={
+                            "job_id": context.job_id,
+                            "certificate_id": item.certificate_id,
+                        },
+                        exc_info=True,
+                    )
                 return RenderOutcome(item.certificate_id, False, None, None)
-            sha256 = _sha256_file(destination)
-            self.storage.put_file(destination, key, "application/pdf")
         return RenderOutcome(item.certificate_id, True, key, sha256)
 
     def _persist_outcomes(

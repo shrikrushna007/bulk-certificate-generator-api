@@ -22,7 +22,9 @@ def upgrade() -> None:
 
     with op.batch_alter_table("certificate_records") as batch_op:
         batch_op.add_column(sa.Column("claim_token", sa.String(36), nullable=True))
-        batch_op.add_column(sa.Column("lease_expires_at", sa.DateTime(timezone=True), nullable=True))
+        batch_op.add_column(
+            sa.Column("lease_expires_at", sa.DateTime(timezone=True), nullable=True)
+        )
         batch_op.add_column(
             sa.Column("attempt_count", sa.Integer(), nullable=False, server_default="0")
         )

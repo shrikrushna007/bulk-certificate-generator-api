@@ -43,6 +43,7 @@ from app.services.archive import ArchiveFileMissingError, ArchiveIntegrityError
 from app.services.csv_import import CsvImportError, inspect_csv, iter_csv_recipients
 from app.services.dispatch import DispatchUnavailableError
 from app.services.jobs import IdempotencyConflictError, JobService
+from app.services.storage import ArtifactNotFoundError
 
 router = APIRouter()
 
@@ -401,7 +402,10 @@ def verify_certificate(
                 "message": "This certificate does not have recorded integrity metadata.",
             },
         )
-    computed = request.app.state.storage.sha256_key(certificate.file_path)
+    try:
+        computed = request.app.state.storage.sha256_key(certificate.file_path)
+    except ArtifactNotFoundError as exc:
+        raise _certificate_file_missing() from exc
     return CertificateVerificationResponse(
         job_id=job_id,
         certificate_id=certificate_id,
@@ -423,10 +427,15 @@ def download_certificate(
     job_service: Annotated[JobService, Depends(get_job_service)],
 ) -> StreamingResponse:
     certificate = _available_certificate(job_id, certificate_id, request, job_service)
-    if (
-        certificate.sha256
-        and request.app.state.storage.sha256_key(certificate.file_path) != certificate.sha256
-    ):
+    try:
+        computed_sha256 = (
+            request.app.state.storage.sha256_key(certificate.file_path)
+            if certificate.sha256
+            else None
+        )
+    except ArtifactNotFoundError as exc:
+        raise _certificate_file_missing() from exc
+    if certificate.sha256 and computed_sha256 != certificate.sha256:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
@@ -478,6 +487,16 @@ def _available_certificate(
             },
         )
     return certificate
+
+
+def _certificate_file_missing() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail={
+            "code": "certificate_file_missing",
+            "message": "The generated certificate file is no longer available.",
+        },
+    )
 
 
 def _normalize_idempotency_key(idempotency_key: str | None) -> str | None:

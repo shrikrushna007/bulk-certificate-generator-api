@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from threading import Barrier, Lock, get_ident
 
+from app.schemas.jobs import JobCreateRequest
+
 
 class SelectiveFailureRenderer:
     def __init__(self, delegate) -> None:
@@ -61,12 +63,33 @@ def test_batch_rendering_uses_bounded_concurrency(client, app, valid_payload) ->
     assert len(probe.thread_ids) == 2
 
 
-def test_unprocessed_job_exposes_pending_status_and_consistent_counts(app, valid_payload) -> None:
-    from app.schemas.jobs import JobCreateRequest
+def test_local_artifact_hash_failure_is_isolated(app, valid_payload, monkeypatch) -> None:
+    job = app.state.job_service.create_job(JobCreateRequest.model_validate(valid_payload)).job
+    records = app.state.job_service.list_certificates(job.id, 0, job.total_count)
+    failing_certificate_id = records[0].id
+    original_sha256 = app.state.storage.sha256
 
-    job = app.state.job_service.create_job(
-        JobCreateRequest.model_validate(valid_payload)
-    ).job
+    def selective_sha256(path):
+        if failing_certificate_id in str(path):
+            raise OSError("simulated artifact read failure")
+        return original_sha256(path)
+
+    monkeypatch.setattr(app.state.storage, "sha256", selective_sha256)
+
+    app.state.job_processor.process(job.id)
+
+    stored = app.state.job_service.get_job(job.id)
+    outcomes = app.state.job_service.list_certificates(job.id, 0, job.total_count)
+    assert stored is not None
+    assert stored.status.value == "PARTIALLY_COMPLETED"
+    assert stored.success_count == 1
+    assert stored.failure_count == 1
+    assert stored.pending_count == 0
+    assert [record.status.value for record in outcomes] == ["FAILED", "COMPLETED"]
+
+
+def test_unprocessed_job_exposes_pending_status_and_consistent_counts(app, valid_payload) -> None:
+    job = app.state.job_service.create_job(JobCreateRequest.model_validate(valid_payload)).job
     stored = app.state.job_service.get_job(job.id)
 
     assert stored is not None
@@ -75,3 +98,34 @@ def test_unprocessed_job_exposes_pending_status_and_consistent_counts(app, valid
     assert stored.failure_count == 0
     assert stored.pending_count == 2
     assert stored.progress_percentage == 0.0
+
+
+def test_processing_transition_preserves_pending_counts(app, valid_payload) -> None:
+    job = app.state.job_service.create_job(JobCreateRequest.model_validate(valid_payload)).job
+
+    context = app.state.job_processor._start_job(job.id)
+
+    stored = app.state.job_service.get_job(job.id)
+    assert context is not None
+    assert stored is not None
+    assert stored.status.value == "PROCESSING"
+    assert stored.success_count == 0
+    assert stored.failure_count == 0
+    assert stored.pending_count == 2
+    assert stored.progress_percentage == 0.0
+    assert stored.started_at is not None
+    assert stored.completed_at is None
+
+
+def test_validation_failures_are_reflected_in_pending_progress(app, valid_payload) -> None:
+    valid_payload["recipients"].insert(0, {"name": ""})
+
+    job = app.state.job_service.create_job(JobCreateRequest.model_validate(valid_payload)).job
+    stored = app.state.job_service.get_job(job.id)
+
+    assert stored is not None
+    assert stored.status.value == "PENDING"
+    assert stored.success_count == 0
+    assert stored.failure_count == 1
+    assert stored.pending_count == 2
+    assert stored.progress_percentage == 33.33

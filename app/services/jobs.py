@@ -150,6 +150,9 @@ class JobService:
                     session.execute(insert(CertificateRecord), records)
                 if record_count != total_count:
                     raise ValueError("Recipient stream changed while the job was created.")
+                if job.failure_count == job.total_count:
+                    job.status = JobStatus.FAILED
+                    job.completed_at = datetime.now(UTC)
                 session.commit()
                 session.refresh(job)
         except IntegrityError:
@@ -207,14 +210,23 @@ class JobService:
         job_id: str,
         batch_size: int = 1_000,
     ) -> Iterator[CertificateRecord]:
-        with self.database.session() as session:
-            statement = (
-                select(CertificateRecord)
-                .where(CertificateRecord.job_id == job_id)
-                .order_by(CertificateRecord.recipient_index)
-                .execution_options(yield_per=batch_size)
-            )
-            yield from session.scalars(statement)
+        next_index = 0
+        while True:
+            with self.database.session() as session:
+                statement = (
+                    select(CertificateRecord)
+                    .where(
+                        CertificateRecord.job_id == job_id,
+                        CertificateRecord.recipient_index >= next_index,
+                    )
+                    .order_by(CertificateRecord.recipient_index)
+                    .limit(batch_size)
+                )
+                records = list(session.scalars(statement))
+            if not records:
+                return
+            yield from records
+            next_index = records[-1].recipient_index + 1
 
     def get_certificate(self, job_id: str, certificate_id: str) -> CertificateRecord | None:
         with self.database.session() as session:
@@ -400,9 +412,10 @@ class JobProcessor:
                 issue_date=context.issue_date,
                 certificate_id=item.certificate_id,
             )
+            sha256 = self.storage.sha256(destination)
         except Exception:
             logger.exception(
-                "Certificate rendering failed",
+                "Certificate rendering or hashing failed",
                 extra={
                     "job_id": context.job_id,
                     "certificate_id": item.certificate_id,
@@ -414,7 +427,7 @@ class JobProcessor:
             item.certificate_id,
             True,
             relative_path.as_posix(),
-            self.storage.sha256(destination),
+            sha256,
         )
 
     def _persist_outcomes(self, job_id: str, outcomes: list[RenderOutcome]) -> None:

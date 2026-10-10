@@ -35,6 +35,12 @@ def validate_recipient(name: Any, email: Any) -> ValidatedRecipient:
             _safe_email(email),
             "Recipient name must not exceed 200 characters.",
         )
+    if not is_supported_certificate_text(normalized_name):
+        return ValidatedRecipient(
+            None,
+            _safe_email(email),
+            "Recipient name contains characters unsupported by the certificate template.",
+        )
 
     if email is None:
         return ValidatedRecipient(normalized_name, None, None)
@@ -49,6 +55,19 @@ def validate_recipient(name: Any, email: Any) -> ValidatedRecipient:
     ):
         return ValidatedRecipient(normalized_name, None, "Recipient email is not valid.")
     return ValidatedRecipient(normalized_name, normalized_email, None)
+
+
+def is_supported_certificate_text(value: str) -> bool:
+    """Return whether the predefined Helvetica template can render the text faithfully."""
+    try:
+        value.encode("cp1252")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def contains_control_characters(value: str) -> bool:
+    return CONTROL_CHARACTERS.search(value) is not None
 
 
 def _safe_email(value: Any) -> str | None:

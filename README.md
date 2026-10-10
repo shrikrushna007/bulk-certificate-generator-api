@@ -220,7 +220,7 @@ certificate in the target region. Supply the certificate through the CloudFormat
 ```powershell
 npx --yes aws-cdk@2.1144.0 bootstrap aws://ACCOUNT_ID/ap-south-1
 npx --yes aws-cdk@2.1144.0 deploy CertFlowProduction `
-  --parameters CertificateArn=arn:aws:acm:ap-south-1:ACCOUNT_ID:certificate/CERTIFICATE_ID
+  --parameters CertFlowProduction:CertificateArn=arn:aws:acm:ap-south-1:ACCOUNT_ID:certificate/CERTIFICATE_ID
 ```
 
 After deployment, create a DNS CNAME from `certificates.shrikrushna.me` to the
@@ -322,6 +322,29 @@ curl "http://localhost:8000/api/v1/jobs/03bd7f9c-0c5d-42e3-8f34-6d86256c4693?inc
 
 Recipient details are paginated with `recipient_offset` and `recipient_limit`; the maximum page size is 500.
 
+Example completed status response, abbreviated to one recipient:
+
+```json
+{
+  "job_id": "03bd7f9c-0c5d-42e3-8f34-6d86256c4693",
+  "status": "COMPLETED",
+  "total_recipients": 2,
+  "successful_generations": 2,
+  "failed_generations": 0,
+  "pending_generations": 0,
+  "progress_percentage": 100.0,
+  "recipients": [
+    {
+      "certificate_id": "f521d6bf-c521-42c5-9185-59824bf02d42",
+      "recipient_index": 0,
+      "recipient_name": "Aarav Sharma",
+      "status": "COMPLETED",
+      "download_url": "/api/v1/jobs/03bd7f9c-0c5d-42e3-8f34-6d86256c4693/certificates/f521d6bf-c521-42c5-9185-59824bf02d42"
+    }
+  ]
+}
+```
+
 Download and verify one certificate:
 
 ```bash
@@ -340,7 +363,7 @@ The ZIP contains successful PDFs under `certificates/` and `report.csv` containi
 
 ## Validation and failure behavior
 
-Missing certificate fields, invalid dates, an empty recipient collection, and malformed request envelopes are request-level errors and return HTTP 422 without creating work. Recipient names and emails are evaluated independently. A bad recipient becomes a failed outcome while valid recipients continue.
+Missing certificate fields, invalid dates, an empty recipient collection, malformed request envelopes, control characters, and certificate text unsupported by the predefined font are request-level errors and return HTTP 422 without creating work. Recipient names and emails are evaluated independently. A bad recipient becomes a failed outcome while valid recipients continue. The Helvetica-based template accepts Windows-1252 text; names outside that character set fail validation instead of producing a misleading PDF with replacement glyphs.
 
 Worker failures are contained by recipient batches. Completed rows remain committed, claimed rows become eligible after their leases expire, and the periodic recovery task redispatches unfinished jobs. Counters are updated only by the worker that still owns a claim token. Jobs finish as `COMPLETED`, `PARTIALLY_COMPLETED`, or `FAILED` only when all recipients have terminal outcomes.
 
@@ -355,7 +378,7 @@ pytest --cov=app --cov-report=term-missing
 alembic check
 ```
 
-Tests use isolated temporary databases and storage. They exercise the real API, ReportLab rendering, PDF text extraction, persistence, invalid recipients, one failure among 100 recipients, idempotency, restart recovery, distributed batch claims, archive leases, checksums, ZIP contents, and S3 response-stream cleanup.
+Tests use isolated temporary databases and storage. They exercise the real API, ReportLab rendering, PDF text extraction, persistence, invalid recipients, all-invalid jobs, one failure among 100 recipients, local hashing failures, distributed upload failures, idempotency, restart recovery, distributed batch claims, archive leases, checksum races, ZIP contents, bounded database-session use, and S3 response-stream cleanup.
 
 ## Reproducible benchmark
 
@@ -430,7 +453,7 @@ deployed evaluation environment, not generalized throughput guarantees.
 - Celery recovery retries transient failures, but there is no operator-facing dead-letter queue or per-recipient manual retry endpoint.
 - There is no authentication, authorization, tenant isolation, cancellation, or retention scheduler.
 - Generated objects and idempotency records do not expire automatically.
-- The bundled ReportLab core fonts do not cover every writing system.
+- The predefined Helvetica template supports Windows-1252 text. Other scripts are rejected explicitly; multilingual certificate rendering requires an embedded, appropriately licensed font plus shaping and layout tests.
 - The Compose distributed profile is a local demonstration topology, not a highly available production deployment.
 
 ## Future improvements

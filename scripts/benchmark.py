@@ -130,18 +130,13 @@ def main() -> None:
         health = client.get(f"{base_url}/health")
         health.raise_for_status()
         for size in args.sizes:
-            results.append(
-                run_case(client, base_url, size, args.max_wait, args.transport)
-            )
+            results.append(run_case(client, base_url, size, args.max_wait, args.transport))
 
     if args.as_json:
         print(json.dumps([asdict(result) for result in results], indent=2))
         return
 
-    print(
-        "| Job ID | Recipients | Acceptance (s) | Completion (s) | "
-        "Success | Failed | PDFs/s |"
-    )
+    print("| Job ID | Recipients | Acceptance (s) | Completion (s) | Success | Failed | PDFs/s |")
     print("|---|---:|---:|---:|---:|---:|---:|")
     for result in results:
         print(

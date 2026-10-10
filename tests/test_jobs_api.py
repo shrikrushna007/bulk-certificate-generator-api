@@ -6,6 +6,8 @@ from unittest.mock import Mock
 from pypdf import PdfReader
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.services.storage import ArtifactNotFoundError
+
 
 def create_job(client, payload: dict) -> tuple[dict, dict]:
     creation = client.post("/api/v1/jobs", json=payload)
@@ -63,6 +65,7 @@ def test_generated_pdf_is_retrievable_and_contains_expected_text(client, valid_p
     assert "Aarav Sharma" in extracted
     assert "Backend Engineering Foundations" in extracted
     assert "AEREO Learning" in extracted
+    assert "2026-10-08" in extracted
     assert certificate["certificate_id"] in extracted
 
 
@@ -103,6 +106,20 @@ def test_all_invalid_recipients_produce_failed_job(client, valid_payload) -> Non
     assert job["progress_percentage"] == 100.0
 
 
+def test_all_invalid_job_is_terminal_before_background_dispatch(client, valid_payload) -> None:
+    valid_payload["recipients"] = [{"name": ""}, {"name": None}]
+
+    response = client.post("/api/v1/jobs", json=valid_payload)
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "FAILED"
+    job = client.get(response.json()["status_url"]).json()
+    assert job["status"] == "FAILED"
+    assert job["pending_generations"] == 0
+    assert job["progress_percentage"] == 100.0
+    assert job["completed_at"] is not None
+
+
 def test_duplicate_names_generate_distinct_certificates(client, valid_payload) -> None:
     valid_payload["recipients"] = [{"name": "Same Name"}, {"name": "Same Name"}]
 
@@ -122,7 +139,10 @@ def test_long_recipient_name_generates_valid_pdf(client, valid_payload) -> None:
     assert job["status"] == "COMPLETED"
     response = client.get(job["recipients"][0]["download_url"])
     assert response.status_code == 200
-    assert len(PdfReader(BytesIO(response.content)).pages) == 1
+    reader = PdfReader(BytesIO(response.content))
+    extracted = " ".join((reader.pages[0].extract_text() or "").split())
+    assert len(reader.pages) == 1
+    assert long_name.strip() in extracted
 
 
 def test_multiple_jobs_are_independent(client, valid_payload) -> None:
@@ -208,6 +228,26 @@ def test_missing_generated_file_returns_410(client, app, valid_payload) -> None:
 
     assert response.status_code == 410
     assert response.json()["error"]["code"] == "certificate_file_missing"
+
+
+def test_file_removed_during_checksum_returns_410(client, app, valid_payload, monkeypatch) -> None:
+    _, job = create_job(client, valid_payload)
+    certificate = job["recipients"][0]
+
+    monkeypatch.setattr(app.state.storage, "exists", lambda _key: True)
+
+    def missing_during_read(_key: str) -> str:
+        raise ArtifactNotFoundError("removed-after-metadata-check")
+
+    monkeypatch.setattr(app.state.storage, "sha256_key", missing_during_read)
+
+    download = client.get(certificate["download_url"])
+    verification = client.get(f"{certificate['download_url']}/verify")
+
+    assert download.status_code == 410
+    assert download.json()["error"]["code"] == "certificate_file_missing"
+    assert verification.status_code == 410
+    assert verification.json()["error"]["code"] == "certificate_file_missing"
 
 
 def test_failed_certificate_cannot_be_downloaded(client, valid_payload) -> None:

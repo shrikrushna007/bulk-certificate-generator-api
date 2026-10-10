@@ -96,7 +96,10 @@ class CertificateStorage:
         return _sha256_chunks(_file_chunks(path))
 
     def sha256_key(self, key: str) -> str:
-        return self.sha256(self.resolve(key))
+        try:
+            return self.sha256(self.resolve(key))
+        except FileNotFoundError as exc:
+            raise ArtifactNotFoundError(key) from exc
 
     def ensure_ready(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)

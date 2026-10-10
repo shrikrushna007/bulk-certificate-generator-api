@@ -30,9 +30,7 @@ def test_idempotency_replays_original_job(client, app, valid_payload) -> None:
         assert session.scalar(select(func.count(CertificateJob.id))) == 1
         job = session.scalar(select(CertificateJob))
         assert job is not None
-        expected_key_hash = hashlib.sha256(
-            headers["Idempotency-Key"].encode()
-        ).hexdigest()
+        expected_key_hash = hashlib.sha256(headers["Idempotency-Key"].encode()).hexdigest()
         assert job.idempotency_key_hash == expected_key_hash
         assert headers["Idempotency-Key"] not in job.idempotency_key_hash
 
@@ -78,9 +76,7 @@ def test_certificate_checksum_and_integrity_verification(client, app, valid_payl
     assert verified.json()["valid"] is True
     assert verified.json()["stored_sha256"] == certificate["sha256"]
 
-    record = app.state.job_service.get_certificate(
-        job["job_id"], certificate["certificate_id"]
-    )
+    record = app.state.job_service.get_certificate(job["job_id"], certificate["certificate_id"])
     assert record is not None and record.file_path is not None
     path = app.state.storage.resolve(record.file_path)
     with path.open("ab") as pdf:
@@ -131,9 +127,7 @@ def test_archive_reports_missing_successful_file(client, app, valid_payload) -> 
     creation = client.post("/api/v1/jobs", json=valid_payload).json()
     job = client.get(creation["status_url"]).json()
     certificate = job["recipients"][0]
-    record = app.state.job_service.get_certificate(
-        job["job_id"], certificate["certificate_id"]
-    )
+    record = app.state.job_service.get_certificate(job["job_id"], certificate["certificate_id"])
     assert record is not None and record.file_path is not None
     app.state.storage.resolve(record.file_path).unlink()
 
@@ -193,22 +187,14 @@ class Recipient37FailureRenderer:
         self.delegate.render(**kwargs)
 
 
-def test_one_failure_in_100_recipients_preserves_99_downloads(
-    client, app, valid_payload
-) -> None:
+def test_one_failure_in_100_recipients_preserves_99_downloads(client, app, valid_payload) -> None:
     app.state.settings.max_recipients = 100
     app.state.job_processor.batch_size = 25
-    app.state.job_processor.renderer = Recipient37FailureRenderer(
-        app.state.job_processor.renderer
-    )
-    valid_payload["recipients"] = [
-        {"name": f"Recipient {index}"} for index in range(1, 101)
-    ]
+    app.state.job_processor.renderer = Recipient37FailureRenderer(app.state.job_processor.renderer)
+    valid_payload["recipients"] = [{"name": f"Recipient {index}"} for index in range(1, 101)]
 
     creation = client.post("/api/v1/jobs", json=valid_payload)
-    job = client.get(
-        creation.json()["status_url"], params={"recipient_limit": 100}
-    ).json()
+    job = client.get(creation.json()["status_url"], params={"recipient_limit": 100}).json()
 
     assert job["status"] == "PARTIALLY_COMPLETED"
     assert job["successful_generations"] == 99

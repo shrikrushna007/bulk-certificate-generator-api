@@ -86,6 +86,52 @@ def test_invalid_email_is_an_individual_failure(client, valid_payload) -> None:
     assert job["recipients"][1]["status"] == "COMPLETED"
 
 
+def test_unsupported_recipient_characters_are_isolated(client, valid_payload) -> None:
+    valid_payload["recipients"] = [
+        {"name": "श्रीकृष्ण पाटील"},
+        {"name": "Supported Recipient"},
+    ]
+
+    creation = client.post("/api/v1/jobs", json=valid_payload)
+    job = client.get(creation.json()["status_url"]).json()
+
+    assert job["status"] == "PARTIALLY_COMPLETED"
+    assert job["successful_generations"] == 1
+    assert job["failed_generations"] == 1
+    assert job["recipients"][0]["error_message"] == (
+        "Recipient name contains characters unsupported by the certificate template."
+    )
+
+
+def test_unsupported_certificate_text_is_rejected(client, valid_payload) -> None:
+    valid_payload["certificate"]["title"] = "अभियांत्रिकी"
+
+    response = client.post("/api/v1/jobs", json=valid_payload)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "request_validation_error"
+
+
+def test_certificate_control_characters_are_rejected(client, valid_payload) -> None:
+    valid_payload["certificate"]["title"] = "Backend\x00Engineering"
+
+    response = client.post("/api/v1/jobs", json=valid_payload)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "request_validation_error"
+
+
+def test_certificate_text_is_unicode_normalized(client, valid_payload) -> None:
+    valid_payload["certificate"]["title"] = "Cafe\u0301 Engineering"
+
+    creation = client.post("/api/v1/jobs", json=valid_payload)
+    job = client.get(creation.json()["status_url"]).json()
+
+    assert creation.status_code == 202
+    assert job["certificate_title"] == "Café Engineering"
+    assert job["status"] == "COMPLETED"
+
+
 def test_explicit_s3_credentials_must_be_complete() -> None:
     with pytest.raises(ValidationError, match="must be configured together"):
         Settings(s3_access_key_id="local-access-key")
