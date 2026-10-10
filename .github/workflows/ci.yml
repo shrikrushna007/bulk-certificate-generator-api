@@ -14,8 +14,8 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -27,4 +27,3 @@ jobs:
         run: ruff check .
       - name: Test
         run: pytest --cov=app --cov-report=term-missing
-
