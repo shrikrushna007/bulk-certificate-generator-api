@@ -71,13 +71,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.state.settings = resolved_settings
     application.state.database = database
     application.state.storage = storage
-    archive_builder = JobArchiveBuilder(storage)
+    archive_builder = JobArchiveBuilder(
+        storage, download_workers=resolved_settings.archive_download_workers
+    )
     application.state.archive_builder = archive_builder
     application.state.archive_processor = ArchiveProcessor(
         database,
         storage,
         archive_builder,
-        resolved_settings.claim_timeout_seconds,
+        resolved_settings.archive_claim_timeout_seconds,
     )
     application.state.job_service = JobService(database)
     application.state.job_processor = job_processor

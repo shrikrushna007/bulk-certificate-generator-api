@@ -249,9 +249,7 @@ class CertFlowStack(Stack):
             access_string="off ~* -@all",
             authentication_mode={
                 "Type": "password",
-                "Passwords": [
-                    cache_secret.secret_value_from_json("password").unsafe_unwrap()
-                ],
+                "Passwords": [cache_secret.secret_value_from_json("password").unsafe_unwrap()],
             },
         )
         application_cache_user = elasticache.CfnUser(
@@ -263,9 +261,7 @@ class CertFlowStack(Stack):
             access_string="on ~* +@all",
             authentication_mode={
                 "Type": "password",
-                "Passwords": [
-                    cache_secret.secret_value_from_json("password").unsafe_unwrap()
-                ],
+                "Passwords": [cache_secret.secret_value_from_json("password").unsafe_unwrap()],
             },
         )
         cache_user_group = elasticache.CfnUserGroup(
@@ -416,6 +412,8 @@ class CertFlowStack(Stack):
             "DISTRIBUTED_JOB_PARALLELISM": "16",
             "RENDER_WORKERS": "2",
             "CLAIM_TIMEOUT_SECONDS": "300",
+            "ARCHIVE_CLAIM_TIMEOUT_SECONDS": "3600",
+            "ARCHIVE_DOWNLOAD_WORKERS": "16",
             "LOG_LEVEL": "INFO",
             "LOG_FORMAT": "json",
         }
@@ -448,12 +446,10 @@ class CertFlowStack(Stack):
             environment=common_environment,
             secrets=common_secrets,
             command=[
-                "celery",
-                "-A",
-                "app.celery_app:celery_app",
-                "worker",
-                "--loglevel=INFO",
-                "--concurrency=2",
+                "sh",
+                "-c",
+                "python -m app.migrate && exec celery -A app.celery_app:celery_app "
+                "worker --loglevel=INFO --concurrency=2",
             ],
         )
         beat_task, _ = self._task_definition(
@@ -465,12 +461,10 @@ class CertFlowStack(Stack):
             environment=common_environment,
             secrets=common_secrets,
             command=[
-                "celery",
-                "-A",
-                "app.celery_app:celery_app",
-                "beat",
-                "--loglevel=INFO",
-                "--schedule=/tmp/celerybeat-schedule",
+                "sh",
+                "-c",
+                "python -m app.migrate && exec celery -A app.celery_app:celery_app "
+                "beat --loglevel=INFO --schedule=/tmp/celerybeat-schedule",
             ],
         )
 

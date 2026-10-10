@@ -240,6 +240,13 @@ def get_job(
             if job.archive_status == ArchiveStatus.COMPLETED
             else None
         ),
+        archive_total_files=job.archive_total_count,
+        archive_processed_files=job.archive_processed_count,
+        archive_progress_percentage=job.archive_progress_percentage,
+        archive_started_at=job.archive_started_at,
+        archive_completed_at=job.archive_completed_at,
+        archive_elapsed_seconds=job.archive_elapsed_seconds,
+        archive_estimated_remaining_seconds=job.archive_estimated_remaining_seconds,
         recipients=outcomes,
         recipient_page=recipient_page,
     )
@@ -331,9 +338,7 @@ def download_job_archive(
         return StreamingResponse(
             request.app.state.storage.iter_bytes(job.archive_path),
             media_type="application/zip",
-            headers={
-                "Content-Disposition": f'attachment; filename="certificates-{job.id}.zip"'
-            },
+            headers={"Content-Disposition": f'attachment; filename="certificates-{job.id}.zip"'},
         )
     if request.app.state.settings.processing_mode == "distributed":
         raise HTTPException(
@@ -432,9 +437,7 @@ def download_certificate(
     return StreamingResponse(
         request.app.state.storage.iter_bytes(certificate.file_path),
         media_type="application/pdf",
-        headers={
-            "Content-Disposition": f'attachment; filename="certificate-{certificate.id}.pdf"'
-        },
+        headers={"Content-Disposition": f'attachment; filename="certificate-{certificate.id}.pdf"'},
     )
 
 

@@ -89,6 +89,13 @@ class JobStatusResponse(BaseModel):
     completed_at: datetime | None
     archive_status: ArchiveStatus
     archive_download_url: str | None
+    archive_total_files: int
+    archive_processed_files: int
+    archive_progress_percentage: float
+    archive_started_at: datetime | None
+    archive_completed_at: datetime | None
+    archive_elapsed_seconds: int | None
+    archive_estimated_remaining_seconds: int | None
     recipients: list[CertificateOutcomeResponse]
     recipient_page: RecipientPageResponse | None
 

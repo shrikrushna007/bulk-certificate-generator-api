@@ -37,8 +37,8 @@ def _components() -> tuple[
     archive_processor = ArchiveProcessor(
         database,
         storage,
-        JobArchiveBuilder(storage),
-        settings.claim_timeout_seconds,
+        JobArchiveBuilder(storage, download_workers=settings.archive_download_workers),
+        settings.archive_claim_timeout_seconds,
     )
     return processor, dispatcher, archive_processor
 

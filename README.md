@@ -257,6 +257,8 @@ and database snapshot resources require deliberate cleanup after stack deletion.
 | `PROCESSING_BATCH_SIZE` | `100` | Rows claimed or persisted per batch |
 | `DISTRIBUTED_JOB_PARALLELISM` | `4` | Queue tasks dispatched per job |
 | `CLAIM_TIMEOUT_SECONDS` | `300` | Lease duration before recovery eligibility |
+| `ARCHIVE_CLAIM_TIMEOUT_SECONDS` | `3600` | Renewable ZIP-generation lease duration |
+| `ARCHIVE_DOWNLOAD_WORKERS` | `16` | Concurrent artifact reads used by each ZIP task |
 | `CELERY_BROKER_URL` | local Redis URL | Celery broker connection |
 | `CELERY_BROKER_HOST` | empty | Optional secret-injected Redis or Valkey host |
 | `CELERY_BROKER_PORT` | `6379` | Redis-compatible broker port |
@@ -401,8 +403,13 @@ tasks, and one scheduler task. A live HTTPS request created a two-recipient job,
 completed, and an immediate retry with the same idempotency key returned the original job. A
 downloaded PDF matched its stored SHA-256 checksum and rendered correctly. The asynchronous ZIP
 contained both PDFs and the complete CSV report, and the corresponding S3 objects reported
-SSE-KMS encryption. This smoke test verifies the deployed workflow; it is not a production load
-test.
+SSE-KMS encryption.
+
+A subsequent 10,000-recipient CSV job generated all PDFs in approximately 58 seconds. Its archive
+builder fetched artifacts with 16 bounded concurrent reads, persisted progress every 100 files,
+and produced the 10,000-PDF ZIP in 28.5 seconds. The downloaded 16.49 MB archive contained 10,001
+valid entries: `report.csv` with 10,000 rows and 10,000 PDFs. These are observations from the
+deployed evaluation environment, not generalized throughput guarantees.
 
 ## Design decisions and trade-offs
 
@@ -412,13 +419,14 @@ test.
 - **At-least-once delivery:** Celery tasks may run more than once. Correctness comes from database state and fencing, not an assumption of exactly-once delivery.
 - **Bounded concurrency:** Worker processes and render threads are explicit controls. Increasing them beyond CPU, database, or storage capacity can reduce throughput.
 - **Attempt-specific objects:** A stale attempt writes a unique key and cannot replace the accepted file. Best-effort cleanup removes artifacts from rejected attempts.
-- **Asynchronous archives:** Distributed archives use their own leases and object keys because compressing a large job inside an API request would monopolize that process.
+- **Asynchronous archives:** Distributed archives use renewable leases, persisted progress, bounded concurrent object reads, and attempt-specific keys. This keeps the request path short while fencing stale builders and avoiding unbounded memory use.
 - **Integrity, not authenticity:** SHA-256 detects corruption relative to stored metadata. It is not a digital signature and does not establish the issuer's identity.
 
 ## Known limitations
 
 - CSV ingestion is memory-bounded but synchronous and atomic; extremely large imports hold a database transaction open until all rows are inserted.
 - Every certificate still consumes CPU, database metadata, and object-storage capacity. Capacity planning and load testing are required for a target volume.
+- ZIP files are assembled on worker ephemeral storage before upload; exceptionally large exports remain constrained by that storage capacity and should eventually use multipart or segmented delivery.
 - Celery recovery retries transient failures, but there is no operator-facing dead-letter queue or per-recipient manual retry endpoint.
 - There is no authentication, authorization, tenant isolation, cancellation, or retention scheduler.
 - Generated objects and idempotency records do not expire automatically.

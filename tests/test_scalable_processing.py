@@ -18,8 +18,7 @@ from app.services.distributed_jobs import DistributedJobProcessor
 def _csv_file(recipient_count: int) -> io.BytesIO:
     rows = ["name,email"]
     rows.extend(
-        f"CSV Recipient {index},recipient{index}@example.com"
-        for index in range(recipient_count)
+        f"CSV Recipient {index},recipient{index}@example.com" for index in range(recipient_count)
     )
     return io.BytesIO(("\n".join(rows) + "\n").encode())
 
@@ -37,9 +36,7 @@ def test_streaming_csv_import_creates_large_job_without_json_limit(client) -> No
 
     assert response.status_code == 202
     created = response.json()
-    job = client.get(
-        created["status_url"], params={"include_recipients": "false"}
-    ).json()
+    job = client.get(created["status_url"], params={"include_recipients": "false"}).json()
     assert created["total_recipients"] == 250
     assert job["status"] == "COMPLETED"
     assert job["successful_generations"] == 250
@@ -111,8 +108,7 @@ def test_distributed_processor_claims_and_completes_batches(app, valid_payload) 
     assert all(record.status == CertificateStatus.COMPLETED for record in outcomes)
     assert all(record.attempt_count == 1 for record in outcomes)
     assert all(
-        record.file_path and app.state.storage.exists(record.file_path)
-        for record in outcomes
+        record.file_path and app.state.storage.exists(record.file_path) for record in outcomes
     )
 
 
@@ -155,17 +151,31 @@ def test_stale_distributed_claim_is_recovered(app, valid_payload) -> None:
     assert stored_record.lease_expires_at is None
 
 
-def test_archive_can_be_generated_as_background_work(client, valid_payload) -> None:
+def test_archive_can_be_generated_as_background_work(
+    app, client, valid_payload, monkeypatch
+) -> None:
     created = client.post("/api/v1/jobs", json=valid_payload).json()
 
+    def unexpected_exists_call(_key: str) -> bool:
+        raise AssertionError("Archive creation must not issue a redundant existence check")
+
+    monkeypatch.setattr(app.state.archive_builder.storage, "exists", unexpected_exists_call)
     requested = client.post(f"/api/v1/jobs/{created['job_id']}/archive")
     job = client.get(created["status_url"]).json()
+    monkeypatch.undo()
     archive = client.get(f"/api/v1/jobs/{created['job_id']}/archive")
 
     assert requested.status_code == 202
     assert requested.json()["status"] == "PENDING"
     assert job["archive_status"] == "COMPLETED"
     assert job["archive_download_url"].endswith("/archive")
+    assert job["archive_total_files"] == 2
+    assert job["archive_processed_files"] == 2
+    assert job["archive_progress_percentage"] == 100.0
+    assert job["archive_started_at"] is not None
+    assert job["archive_completed_at"] is not None
+    assert job["archive_elapsed_seconds"] >= 0
+    assert job["archive_estimated_remaining_seconds"] is None
     assert archive.status_code == 200
     assert archive.headers["content-type"] == "application/zip"
 
@@ -178,6 +188,9 @@ def test_stale_archive_claim_is_recovered(app, valid_payload) -> None:
         stored_job = session.get(CertificateJob, job.id)
         assert stored_job is not None
         stored_job.archive_status = ArchiveStatus.PROCESSING
+        stored_job.archive_total_count = 2
+        stored_job.archive_processed_count = 1
+        stored_job.archive_started_at = expired
         stored_job.archive_claim_token = "expired-archive-claim"
         stored_job.archive_lease_expires_at = expired
         session.commit()
@@ -188,5 +201,8 @@ def test_stale_archive_claim_is_recovered(app, valid_payload) -> None:
     assert recovered == [job.id]
     assert stored_job is not None
     assert stored_job.archive_status == ArchiveStatus.PENDING
+    assert stored_job.archive_processed_count == 0
+    assert stored_job.archive_started_at is None
+    assert stored_job.archive_completed_at is None
     assert stored_job.archive_claim_token is None
     assert stored_job.archive_lease_expires_at is None

@@ -14,6 +14,10 @@ from botocore.exceptions import ClientError
 from app.core.config import Settings
 
 
+class ArtifactNotFoundError(FileNotFoundError):
+    """Raised when artifact metadata points to a missing stored object."""
+
+
 class ArtifactStorage(Protocol):
     def key(self, job_id: str, certificate_id: str) -> str: ...
 
@@ -77,9 +81,12 @@ class CertificateStorage:
         return self.resolve(key).is_file()
 
     def iter_bytes(self, key: str, chunk_size: int = 1024 * 1024) -> Iterator[bytes]:
-        with self.resolve(key).open("rb") as artifact:
-            while chunk := artifact.read(chunk_size):
-                yield chunk
+        try:
+            with self.resolve(key).open("rb") as artifact:
+                while chunk := artifact.read(chunk_size):
+                    yield chunk
+        except FileNotFoundError as exc:
+            raise ArtifactNotFoundError(key) from exc
 
     def delete(self, key: str) -> None:
         self.resolve(key).unlink(missing_ok=True)
@@ -155,7 +162,16 @@ class S3CertificateStorage:
             raise
 
     def iter_bytes(self, key: str, chunk_size: int = 1024 * 1024) -> Iterator[bytes]:
-        response = self.client.get_object(Bucket=self.bucket, Key=key)
+        try:
+            response = self.client.get_object(Bucket=self.bucket, Key=key)
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") in {
+                "404",
+                "NoSuchKey",
+                "NotFound",
+            }:
+                raise ArtifactNotFoundError(key) from exc
+            raise
         body = response["Body"]
         try:
             yield from body.iter_chunks(chunk_size=chunk_size)
@@ -177,9 +193,7 @@ class S3CertificateStorage:
                 raise
             create_args: dict[str, object] = {"Bucket": self.bucket}
             if self.region != "us-east-1":
-                create_args["CreateBucketConfiguration"] = {
-                    "LocationConstraint": self.region
-                }
+                create_args["CreateBucketConfiguration"] = {"LocationConstraint": self.region}
             self.client.create_bucket(**create_args)
 
 

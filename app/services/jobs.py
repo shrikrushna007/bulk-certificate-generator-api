@@ -125,9 +125,7 @@ class JobService:
                 for index, recipient_input in enumerate(recipients):
                     recipient = validate_recipient(recipient_input.name, recipient_input.email)
                     record_status = (
-                        CertificateStatus.FAILED
-                        if recipient.error
-                        else CertificateStatus.PENDING
+                        CertificateStatus.FAILED if recipient.error else CertificateStatus.PENDING
                     )
                     records.append(
                         {
@@ -181,9 +179,7 @@ class JobService:
     def _get_job_by_idempotency_key(self, key_hash: str) -> CertificateJob | None:
         with self.database.session() as session:
             return session.scalar(
-                select(CertificateJob).where(
-                    CertificateJob.idempotency_key_hash == key_hash
-                )
+                select(CertificateJob).where(CertificateJob.idempotency_key_hash == key_hash)
             )
 
     @staticmethod
@@ -236,6 +232,10 @@ class JobService:
             if job.archive_status in {ArchiveStatus.NOT_REQUESTED, ArchiveStatus.FAILED}:
                 job.archive_status = ArchiveStatus.PENDING
                 job.archive_error = None
+                job.archive_total_count = job.success_count
+                job.archive_processed_count = 0
+                job.archive_started_at = None
+                job.archive_completed_at = None
                 job.archive_claim_token = None
                 job.archive_lease_expires_at = None
             session.commit()

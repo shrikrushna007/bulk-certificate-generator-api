@@ -221,7 +221,7 @@ function renderJob() {
   elements.failureCount.textContent = job.failed_generations.toLocaleString();
   elements.pendingCount.textContent = job.pending_generations.toLocaleString();
   elements.requestArchive.disabled = ["PENDING", "PROCESSING"].includes(job.status) || ["PENDING", "PROCESSING"].includes(job.archive_status);
-  elements.requestArchive.textContent = archiveButtonLabel(job.archive_status);
+  elements.requestArchive.textContent = archiveButtonLabel(job.archive_status, job.archive_progress_percentage ?? 0);
   renderArchive(job);
   renderRecipients();
   renderPagination();
@@ -238,7 +238,25 @@ function renderArchive(job) {
     elements.archiveMessage.append(document.createTextNode("The job archive is ready. "), link);
     return;
   }
-  const message = job.archive_status === "FAILED" ? "Archive generation failed. You can request it again." : "The ZIP archive is being prepared.";
+  let message = "The ZIP archive is queued.";
+  if (job.archive_status === "PROCESSING") {
+    const processedCount = job.archive_processed_files ?? 0;
+    const totalCount = job.archive_total_files ?? job.successful_generations;
+    const progress = job.archive_progress_percentage ?? 0;
+    const processed = processedCount.toLocaleString();
+    const total = totalCount.toLocaleString();
+    const percentage = progress.toFixed(1);
+    const details = [`${processed} of ${total} files (${percentage}%)`];
+    if (job.archive_elapsed_seconds !== null) {
+      details.push(`elapsed ${formatDuration(job.archive_elapsed_seconds)}`);
+    }
+    if (job.archive_estimated_remaining_seconds !== null) {
+      details.push(`about ${formatDuration(job.archive_estimated_remaining_seconds)} remaining`);
+    }
+    message = `Preparing ZIP: ${details.join(" · ")}.`;
+  } else if (job.archive_status === "FAILED") {
+    message = "Archive generation failed. You can request it again.";
+  }
   showMessage(elements.archiveMessage, message, job.archive_status !== "FAILED");
 }
 
@@ -364,12 +382,23 @@ function showMessage(element, message, success = false) {
 }
 
 function hideMessage(element) { element.classList.add("hidden"); }
-function archiveButtonLabel(status) {
+function archiveButtonLabel(status, progress = 0) {
   if (status === "COMPLETED") return "ZIP ready";
-  if (["PENDING", "PROCESSING"].includes(status)) return "Preparing ZIP";
+  if (status === "PENDING") return "ZIP queued";
+  if (status === "PROCESSING") return `Preparing ZIP ${progress.toFixed(0)}%`;
   if (status === "FAILED") return "Retry ZIP";
   return "Prepare ZIP";
 }
 function formatDate(value) { return new Date(`${value}T00:00:00`).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }); }
 function formatBytes(bytes) { return bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`; }
+function formatDuration(seconds) {
+  const rounded = Math.max(0, Math.round(seconds));
+  if (rounded < 60) return `${rounded}s`;
+  const minutes = Math.floor(rounded / 60);
+  const remainingSeconds = rounded % 60;
+  if (minutes < 60) return remainingSeconds ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
+}
 function toCamelCase(value) { return value.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase()); }

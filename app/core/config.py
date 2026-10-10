@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     processing_batch_size: int = Field(default=100, ge=1, le=1_000)
     distributed_job_parallelism: int = Field(default=4, ge=1, le=128)
     claim_timeout_seconds: int = Field(default=300, ge=30, le=86_400)
+    archive_claim_timeout_seconds: int = Field(default=3_600, ge=300, le=86_400)
+    archive_download_workers: int = Field(default=16, ge=1, le=32)
     celery_broker_url: str = "redis://localhost:6379/0"
     celery_broker_host: str | None = None
     celery_broker_port: int = Field(default=6379, ge=1, le=65_535)

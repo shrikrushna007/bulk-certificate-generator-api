@@ -57,6 +57,14 @@ class CertificateJob(Base):
         CheckConstraint(
             "success_count + failure_count <= total_count", name="ck_jobs_counts_valid"
         ),
+        CheckConstraint(
+            "archive_processed_count >= 0", name="ck_jobs_archive_processed_nonnegative"
+        ),
+        CheckConstraint("archive_total_count >= 0", name="ck_jobs_archive_total_nonnegative"),
+        CheckConstraint(
+            "archive_processed_count <= archive_total_count",
+            name="ck_jobs_archive_counts_valid",
+        ),
         Index("ix_certificate_jobs_status", "status"),
         Index("ix_certificate_jobs_created_at", "created_at"),
         Index("ix_certificate_jobs_dispatch", "status", "last_dispatched_at"),
@@ -100,6 +108,18 @@ class CertificateJob(Base):
     archive_lease_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    archive_total_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    archive_processed_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    archive_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    archive_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     certificates: Mapped[list[CertificateRecord]] = relationship(
         back_populates="job",
@@ -115,6 +135,34 @@ class CertificateJob(Base):
     def progress_percentage(self) -> float:
         processed = self.success_count + self.failure_count
         return round((processed / self.total_count) * 100, 2)
+
+    @property
+    def archive_progress_percentage(self) -> float:
+        if self.archive_status == ArchiveStatus.COMPLETED:
+            return 100.0
+        if self.archive_total_count <= 0:
+            return 0.0
+        return round((self.archive_processed_count / self.archive_total_count) * 100, 2)
+
+    @property
+    def archive_elapsed_seconds(self) -> int | None:
+        if self.archive_started_at is None:
+            return None
+        end = self.archive_completed_at or datetime.now(UTC)
+        return max(0, round((_as_utc(end) - _as_utc(self.archive_started_at)).total_seconds()))
+
+    @property
+    def archive_estimated_remaining_seconds(self) -> int | None:
+        elapsed = self.archive_elapsed_seconds
+        if (
+            self.archive_status != ArchiveStatus.PROCESSING
+            or elapsed is None
+            or elapsed <= 0
+            or self.archive_processed_count <= 0
+        ):
+            return None
+        remaining = self.archive_total_count - self.archive_processed_count
+        return max(0, round(remaining / (self.archive_processed_count / elapsed)))
 
 
 class CertificateRecord(Base):
@@ -158,3 +206,7 @@ class CertificateRecord(Base):
     )
 
     job: Mapped[CertificateJob] = relationship(back_populates="certificates")
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)

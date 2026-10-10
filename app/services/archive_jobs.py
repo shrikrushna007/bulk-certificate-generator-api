@@ -22,19 +22,23 @@ class ClaimedArchive:
     token: str
 
 
+class ArchiveClaimLostError(RuntimeError):
+    """Raised when a stale archive worker no longer owns the database lease."""
+
+
 class ArchiveProcessor:
     def __init__(
         self,
         database: Database,
         storage: ArtifactStorage,
         archive_builder: JobArchiveBuilder,
-        claim_timeout_seconds: int,
+        archive_claim_timeout_seconds: int,
     ) -> None:
         self.database = database
         self.storage = storage
         self.archive_builder = archive_builder
         self.job_service = JobService(database)
-        self.claim_timeout = timedelta(seconds=claim_timeout_seconds)
+        self.claim_timeout = timedelta(seconds=archive_claim_timeout_seconds)
 
     def process(self, job_id: str) -> bool:
         claimed = self._claim(job_id)
@@ -45,6 +49,7 @@ class ArchiveProcessor:
             archive = self.archive_builder.build(
                 claimed.job,
                 lambda: self.job_service.iter_certificates(job_id),
+                progress=lambda processed: self._heartbeat(job_id, claimed.token, processed),
             )
             base_key = self.storage.archive_key(job_id)
             key = f"{base_key.removesuffix('.zip')}-{claimed.token}.zip"
@@ -79,6 +84,9 @@ class ArchiveProcessor:
                     .where(CertificateJob.id.in_(job_ids))
                     .values(
                         archive_status=ArchiveStatus.PENDING,
+                        archive_processed_count=0,
+                        archive_started_at=None,
+                        archive_completed_at=None,
                         archive_claim_token=None,
                         archive_lease_expires_at=None,
                         archive_error="Archive processing was interrupted and will resume.",
@@ -114,6 +122,10 @@ class ArchiveProcessor:
                 .values(
                     archive_status=ArchiveStatus.PROCESSING,
                     archive_error=None,
+                    archive_total_count=CertificateJob.success_count,
+                    archive_processed_count=0,
+                    archive_started_at=now,
+                    archive_completed_at=None,
                     archive_claim_token=token,
                     archive_lease_expires_at=now + self.claim_timeout,
                 )
@@ -124,6 +136,25 @@ class ArchiveProcessor:
             session.commit()
             job = session.get(CertificateJob, job_id)
             return ClaimedArchive(job, token) if job is not None else None
+
+    def _heartbeat(self, job_id: str, claim_token: str, processed: int) -> None:
+        now = datetime.now(UTC)
+        with self.database.session() as session:
+            result = session.execute(
+                update(CertificateJob)
+                .where(
+                    CertificateJob.id == job_id,
+                    CertificateJob.archive_status == ArchiveStatus.PROCESSING,
+                    CertificateJob.archive_claim_token == claim_token,
+                )
+                .values(
+                    archive_processed_count=processed,
+                    archive_lease_expires_at=now + self.claim_timeout,
+                )
+            )
+            session.commit()
+            if result.rowcount != 1:
+                raise ArchiveClaimLostError(f"Archive claim for job {job_id} is no longer active.")
 
     def _complete(self, job_id: str, claim_token: str, key: str) -> bool:
         with self.database.session() as session:
@@ -138,6 +169,8 @@ class ArchiveProcessor:
                     archive_status=ArchiveStatus.COMPLETED,
                     archive_path=key,
                     archive_error=None,
+                    archive_processed_count=CertificateJob.archive_total_count,
+                    archive_completed_at=datetime.now(UTC),
                     archive_claim_token=None,
                     archive_lease_expires_at=None,
                 )

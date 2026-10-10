@@ -19,9 +19,9 @@ This checklist maps assignment and reliability requirements to implementation an
 | Recover interrupted local jobs | Startup reconciliation | Local recovery test and restart exercise |
 | Scale work across processes | PostgreSQL batch claims with `SKIP LOCKED` | Distributed batch claim integration test |
 | Fence stale workers | Claim tokens, leases, attempt-specific object keys | Expired recipient-claim recovery test |
-| Recover interrupted archives | Archive tokens, leases, and periodic dispatch | Expired archive-claim recovery test |
+| Recover interrupted archives | Renewable archive leases, progress heartbeats, and periodic dispatch | Expired archive-claim recovery test |
 | Detect file changes | Persisted SHA-256 plus verify/download checks | Integrity and tampering tests |
-| Export all outcomes | Asynchronous ZIP and complete CSV report | Archive content and background archive tests |
+| Export all outcomes | Asynchronous ZIP, bounded concurrent artifact reads, and complete CSV report | Archive content, progress, and redundant-request regression tests |
 | Use shared artifact storage | Local/S3 abstraction with managed transfers | S3 streamed-body cleanup test and live RustFS workflow |
 | Provide operational context | Structured job lifecycle and failure logs | JSON logging test |
 | Measure real operations | HTTP benchmark with CSV or JSON transport | `scripts/benchmark.py` and documented local results |

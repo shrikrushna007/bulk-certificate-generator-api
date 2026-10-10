@@ -13,6 +13,8 @@ x-app-environment: &app-environment
   PROCESSING_BATCH_SIZE: ${PROCESSING_BATCH_SIZE:-100}
   RENDER_WORKERS: ${RENDER_WORKERS:-1}
   CLAIM_TIMEOUT_SECONDS: ${CLAIM_TIMEOUT_SECONDS:-300}
+  ARCHIVE_CLAIM_TIMEOUT_SECONDS: ${ARCHIVE_CLAIM_TIMEOUT_SECONDS:-3600}
+  ARCHIVE_DOWNLOAD_WORKERS: ${ARCHIVE_DOWNLOAD_WORKERS:-16}
   MAX_RECIPIENTS: ${MAX_RECIPIENTS:-500}
   MAX_CSV_RECIPIENTS: ${MAX_CSV_RECIPIENTS:-0}
   LOG_LEVEL: ${LOG_LEVEL:-INFO}
@@ -21,7 +23,7 @@ x-app-environment: &app-environment
 services:
   api:
     build: .
-    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    command: sh -c "python -m app.migrate && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"
     environment: *app-environment
     ports:
       - "8000:8000"
